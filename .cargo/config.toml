@@ -1,0 +1,3 @@
+# Host workspace (badge-proto, badge-core, badgectl) builds for the host.
+# The firmware has its own .cargo/config.toml in firmware/ that selects
+# xtensa-esp32s3-none-elf, build-std and the probe-rs runner.

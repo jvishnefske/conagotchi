@@ -1,0 +1,34 @@
+# Host workspace: tests and clippy, with and without the developer feature
+# (`badge-core/dev`: GPIO probe requests and screen).
+name: ci
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features badge-core/dev"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: System libraries for probe-rs
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      - name: Toolchain (rust-toolchain.toml pins stable)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.features }}
+      - name: Test
+        run: cargo test --workspace --locked ${{ matrix.features }}
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings

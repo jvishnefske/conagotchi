@@ -1,0 +1,26 @@
+[package]
+name = "badgectl"
+description = "Host CLI that talks to the Conagotchi discovery firmware over probe-rs RTT"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+badge-proto.workspace = true
+badge-core.workspace = true
+heapless.workspace = true
+probe-rs = "0.32.0"
+probe-rs-espressif = "0.32.0"
+# Same version probe-rs-espressif already pulls in; "serialport" adds the
+# ROM/stub serial protocol used by `adopt` to back up and write flash.
+espflash = { version = "4.6.0", default-features = false, features = ["serialport"] }
+serialport = { version = "4.7", default-features = false }
+defmt-decoder = "1.2.0"
+clap = { version = "4.6", features = ["derive", "env"] }
+object = { version = "0.37", default-features = false, features = ["read", "std"] }
+rustc-demangle = "0.1.27"
+anyhow = "1.0.100"
+thiserror = "2.0.18"
+serde_json = "1.0.145"
+ctrlc = "3.4"

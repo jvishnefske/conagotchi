@@ -1,0 +1,108 @@
+# Imperative shell of the Conagotchi discovery firmware (ESP32-S3).
+#
+# Standalone package: it needs the Xtensa toolchain (`esp-new`) and build-std,
+# so it is deliberately not a member of the host workspace one level up.
+[workspace]
+
+[package]
+edition      = "2024"
+name         = "conagotchi-fw"
+rust-version = "1.95"
+version      = "0.1.0"
+publish      = false
+license      = "MIT OR Apache-2.0"
+description  = "Rust discovery firmware for the Conagotchi 2026 badge (ESP32-S3)"
+
+[[bin]]
+name = "conagotchi-fw"
+path = "./src/main.rs"
+test = false
+bench = false
+
+[features]
+# Developer build: GPIO probe pins, GPIO screen and GpioRead / GpioWrite.
+dev = ["badge-core/dev"]
+
+[dependencies]
+badge-core  = { path = "../crates/badge-core" }
+badge-proto = { path = "../crates/badge-proto" }
+
+esp-hal = { version = "~1.2.2", features = ["defmt", "esp32s3", "unstable"] }
+
+esp-rtos = { version = "0.4.0", features = [
+  "defmt",
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32s3",
+] }
+
+defmt                  = "1.0.1"
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["defmt", "esp32s3"] }
+
+embassy-net = { version = "0.9.1", features = [
+  "defmt",
+  "dhcpv4",
+  "medium-ethernet",
+  "tcp",
+  "udp",
+] }
+embedded-io = { version = "0.7.1", features = ["defmt"] }
+embedded-io-async = { version = "0.7.0", features = ["defmt"] }
+esp-alloc = { version = "0.11.0", features = ["defmt", "esp32s3"] }
+panic-rtt-target = { version = "0.2.0", features = ["defmt"] }
+rtt-target = { version = "0.6.2", features = ["defmt"] }
+bt-hci = "0.9.0"
+embassy-executor = { version = "0.10.0", features = ["defmt"] }
+embassy-time = { version = "0.5.0", features = ["defmt"] }
+embassy-sync = { version = "0.8.0", features = ["defmt"] }
+esp-radio = { version = "1.0.0-beta.1", features = [
+  "ble",
+  "coex",
+  "defmt",
+  "esp-alloc",
+  "esp-now",
+  "esp32s3",
+  "unstable",
+  "wifi",
+] }
+smoltcp = { version = "0.14.0", default-features = false, features = [
+  "defmt",
+  "medium-ethernet",
+  "multicast",
+  "proto-dhcpv4",
+  "proto-dns",
+  "proto-ipv4",
+  "socket-dns",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+] }
+trouble-host = { version = "0.7.0", features = ["gatt", "scan", "defmt"] }
+embassy-futures = "0.1.2"
+
+critical-section = "1.2.0"
+static_cell      = "2.1.1"
+heapless         = "0.9.3"
+
+# Flash storage: contacts and the imported radio key in the `conag` partition.
+esp-storage          = { version = "0.10.0", features = ["defmt", "embedded-storage", "esp32s3"] }
+sequential-storage   = { version = "8.0.2", features = ["defmt"] }
+embassy-embedded-hal = { version = "0.6.0", default-features = false }
+
+# Display stack.
+embedded-hal       = "1.0.0"
+embedded-hal-bus   = "0.3.0"
+embedded-graphics  = "0.8.2"
+mipidsi            = "0.10.0"
+
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug         = 2
+lto           = 'fat'
+opt-level     = 's'

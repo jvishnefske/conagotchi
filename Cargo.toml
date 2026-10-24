@@ -1,0 +1,19 @@
+# Host-side workspace: the shared no_std crates (tested on the host) and the
+# `badgectl` probe-rs CLI. The firmware is a separate package in `firmware/`
+# because it needs the Xtensa toolchain and build-std.
+[workspace]
+resolver = "3"
+members = ["crates/badge-proto", "crates/badge-core", "host/badgectl"]
+exclude = ["firmware"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+badge-proto = { path = "crates/badge-proto" }
+badge-core = { path = "crates/badge-core" }
+micropb = { version = "0.6.0", default-features = false, features = ["encode", "decode", "enable-64bit", "container-heapless-0-9"] }
+heapless = "0.9.3"

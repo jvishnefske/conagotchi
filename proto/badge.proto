@@ -1,0 +1,421 @@
+// Conagotchi discovery protocol.
+//
+// Transport: RTT. Host -> badge on down channel "proto-down", badge -> host on
+// up channel "proto-up". Every message is one COBS-encoded frame terminated by
+// a 0x00 byte (see badge-core `frame` module). Frames carry a `HostMsg`
+// (host -> badge) or a `BadgeMsg` (badge -> host).
+//
+// All integers, no floats. Every repeated/string/bytes field has a fixed
+// capacity configured in crates/badge-proto/build.rs so the firmware can
+// decode without a heap.
+
+syntax = "proto3";
+
+package badge;
+
+// ---------------------------------------------------------------- common ---
+
+enum Button {
+  BUTTON_UNSPECIFIED = 0;
+  BUTTON_BOOT = 1;
+  BUTTON_LEFT = 2;
+  BUTTON_SELECT = 3;
+  BUTTON_START = 4;
+  BUTTON_RIGHT = 5;
+}
+
+enum Indicator {
+  INDICATOR_UNSPECIFIED = 0;
+  INDICATOR_ALERT = 1;   // red, GPIO2
+  INDICATOR_RAFFLE = 2;  // green, GPIO4
+}
+
+enum LedPattern {
+  LED_PATTERN_OFF = 0;
+  LED_PATTERN_MANUAL = 1;   // colours set by SetLeds / SetLed
+  LED_PATTERN_RAINBOW = 2;
+  LED_PATTERN_BREATHE = 3;
+  // CHASE and BUTTONS were removed; their values are never reused.
+  reserved 4, 5;
+  reserved "LED_PATTERN_CHASE", "LED_PATTERN_BUTTONS";
+}
+
+enum Screen {
+  SCREEN_HOME = 0;
+  SCREEN_BUTTONS = 1;
+  SCREEN_LEDS = 2;
+  SCREEN_WIFI = 3;
+  SCREEN_BLE = 4;
+  SCREEN_GPIO = 5;
+  SCREEN_HOST = 6;  // text written by the host
+  SCREEN_PET = 7;   // animated cat
+  SCREEN_TRADE = 8;     // Chi trade lobby (stock-badge compatible)
+  SCREEN_CONTACTS = 9;  // badges we completed a trade with
+}
+
+// The six Chi tags the stock firmware knows (`CHI_TAGS` in trade_session.py).
+// On air they are the three-letter tags; an unknown tag never completes.
+enum Chi {
+  CHI_UNSPECIFIED = 0;
+  CHI_VIB = 1;
+  CHI_HCK = 2;
+  CHI_PKT = 3;
+  CHI_ADM = 4;
+  CHI_CRY = 5;
+  CHI_OVR = 6;
+}
+
+// Progress of a Chi trade with one peer.
+enum TradeState {
+  TRADE_STATE_IDLE = 0;
+  TRADE_STATE_INVITING = 1;    // we addressed the peer, waiting for its tag
+  TRADE_STATE_EXCHANGING = 2;  // tags flowing both ways, waiting for confirm
+  TRADE_STATE_COMPLETE = 3;    // received + confirmed; contact saved
+  TRADE_STATE_LOST = 4;        // peer went silent (6 s) or invite expired (20 s)
+  TRADE_STATE_CANCELLED = 5;   // TradeCancel or START on the badge
+}
+
+// How a lobby peer was heard.
+enum Via {
+  VIA_UNSPECIFIED = 0;
+  VIA_BLE = 1;
+  VIA_LINK = 2;  // wired link UART
+}
+
+// What the pet is doing. AUTO cycles through the other modes on a timer.
+enum PetMode {
+  PET_MODE_AUTO = 0;
+  PET_MODE_IDLE = 1;
+  PET_MODE_WALK = 2;
+  PET_MODE_EAT = 3;
+  PET_MODE_PLAY = 4;
+  PET_MODE_SLEEP = 5;
+}
+
+// 0x00RRGGBB packed colour.
+message Rgb {
+  uint32 rgb = 1;
+}
+
+// --------------------------------------------------------------- requests ---
+
+message Ping {
+  uint32 nonce = 1;
+}
+
+message GetInfo {}
+
+message SetLed {
+  uint32 index = 1;  // 0..7
+  Rgb color = 2;
+}
+
+message SetLeds {
+  repeated Rgb colors = 1;  // up to 8, index order
+}
+
+message SetPattern {
+  LedPattern pattern = 1;
+  uint32 brightness = 2;  // 0..255, 0 = keep current
+}
+
+message SetIndicator {
+  Indicator which = 1;
+  bool on = 2;
+}
+
+message GetButtons {}
+
+message ShowScreen {
+  Screen screen = 1;
+}
+
+message DisplayText {
+  string text = 1;     // shown on SCREEN_HOST; '\n' separates lines
+  Rgb fg = 2;
+  Rgb bg = 3;
+}
+
+message DisplayFill {
+  Rgb color = 1;
+}
+
+message DisplayRect {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 w = 3;
+  uint32 h = 4;
+  Rgb color = 5;
+}
+
+message GpioRead {
+  uint32 pin = 1;
+}
+
+message GpioWrite {
+  uint32 pin = 1;
+  bool level = 2;
+}
+
+message WifiScan {}
+
+message WifiConnect {
+  string ssid = 1;
+  string password = 2;
+}
+
+message WifiStatus {}
+
+message BleScan {
+  uint32 duration_ms = 1;  // 0 = default (3000)
+}
+
+message BleAdvertise {
+  string name = 1;  // empty = stop advertising
+}
+
+message SetPetMode {
+  PetMode mode = 1;  // also switches to SCREEN_PET
+}
+
+// Chooses the Chi we offer in trades (default VIB).
+message SetChi {
+  Chi chi = 1;
+}
+
+// Starts a trade with a lobby peer.
+message TradeInvite {
+  string peer = 1;  // 6 uppercase hex digits (last 6 of the peer's unique_id)
+}
+
+message TradeCancel {}
+
+// Lists stored contacts starting at `offset` (one page per request).
+message ListContacts {
+  uint32 offset = 1;
+}
+
+message ClearContacts {}
+
+message GetBleMetrics {}
+
+message GetSync {}
+
+// Lists badges currently heard in the trade lobby.
+message GetLobby {}
+
+message HostMsg {
+  uint32 seq = 1;
+  oneof cmd {
+    Ping ping = 2;
+    GetInfo get_info = 3;
+    SetLed set_led = 4;
+    SetLeds set_leds = 5;
+    SetPattern set_pattern = 6;
+    SetIndicator set_indicator = 7;
+    GetButtons get_buttons = 8;
+    ShowScreen show_screen = 9;
+    DisplayText display_text = 10;
+    DisplayFill display_fill = 11;
+    DisplayRect display_rect = 12;
+    GpioRead gpio_read = 13;
+    GpioWrite gpio_write = 14;
+    WifiScan wifi_scan = 15;
+    WifiConnect wifi_connect = 16;
+    WifiStatus wifi_status = 17;
+    BleScan ble_scan = 18;
+    BleAdvertise ble_advertise = 19;
+    SetPetMode set_pet_mode = 20;
+    SetChi set_chi = 21;
+    TradeInvite trade_invite = 22;
+    TradeCancel trade_cancel = 23;
+    ListContacts list_contacts = 24;
+    ClearContacts clear_contacts = 25;
+    GetBleMetrics get_ble_metrics = 26;
+    GetSync get_sync = 27;
+    GetLobby get_lobby = 28;
+  }
+}
+
+// -------------------------------------------------------------- responses ---
+
+enum ErrorCode {
+  ERROR_CODE_NONE = 0;
+  ERROR_CODE_DECODE = 1;        // frame could not be decoded
+  ERROR_CODE_BAD_ARGUMENT = 2;  // out-of-range index, bad length, ...
+  ERROR_CODE_PIN_NOT_ALLOWED = 3;
+  ERROR_CODE_BUSY = 4;          // a scan is already running
+  ERROR_CODE_RADIO = 5;         // radio driver reported a failure
+  ERROR_CODE_UNSUPPORTED = 6;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string detail = 2;
+}
+
+message Ack {}
+
+message Pong {
+  uint32 nonce = 1;
+  uint64 uptime_ms = 2;
+}
+
+message Info {
+  string firmware = 1;   // crate name + version
+  string chip = 2;       // "esp32s3"
+  bytes mac = 3;         // 6 bytes
+  uint64 uptime_ms = 4;
+  uint32 free_heap = 5;  // radio heap only
+  repeated uint32 probe_pins = 6;  // pins GpioRead/GpioWrite accept
+}
+
+message ButtonState {
+  uint32 pressed_mask = 1;          // bit n = Button enum value n
+  repeated uint32 press_counts = 2; // indexed by Button enum value
+}
+
+message GpioLevel {
+  uint32 pin = 1;
+  bool level = 2;
+}
+
+message AccessPoint {
+  string ssid = 1;
+  bytes bssid = 2;   // 6 bytes
+  sint32 rssi = 3;
+  uint32 channel = 4;
+  uint32 auth = 5;   // esp-radio AuthMethod discriminant, 0 = open
+}
+
+message WifiScanResult {
+  repeated AccessPoint aps = 1;
+}
+
+message WifiState {
+  bool connected = 1;
+  string ssid = 2;
+  bytes ipv4 = 3;   // 4 bytes, empty if no lease
+  sint32 rssi = 4;
+}
+
+message BleDevice {
+  bytes addr = 1;   // 6 bytes, little-endian as on air
+  uint32 addr_kind = 2;
+  sint32 rssi = 3;
+  string name = 4;  // complete or shortened local name, if advertised
+}
+
+message BleScanResult {
+  repeated BleDevice devices = 1;
+}
+
+// A badge we completed a Chi trade with.
+message Contact {
+  string id = 1;     // 6 uppercase hex digits
+  Chi chi = 2;       // Chi received from it in the last trade
+  string name = 3;   // from an overheard OZN profile; empty if unknown
+  uint32 trades = 4; // completed trades with this badge
+}
+
+// One page of contacts (up to 8) plus the total stored.
+message Contacts {
+  repeated Contact contacts = 1;
+  uint32 total = 2;
+  uint32 offset = 3;
+}
+
+message BleMetrics {
+  uint32 adv_per_s = 1;      // advertisements heard in the last second
+  uint32 unique_10s = 2;     // distinct addresses in the last 10 s
+  uint32 oz_badges = 3;      // distinct OZ-advertising badges in the last 10 s
+  sint32 strongest_rssi = 4; // dBm, 0 if nothing heard
+  uint32 lobby_peers = 5;    // badges in the trade lobby right now
+}
+
+message SyncState {
+  uint32 self_id = 1;    // our sync id (from the MAC)
+  uint32 leader_id = 2;  // lowest id heard in the last 3 s (may be self)
+  sint32 offset_ms = 3;  // network time minus local uptime
+  uint32 peers = 4;      // other badges heard in the last 3 s
+}
+
+message LobbyPeer {
+  string id = 1;   // 6 uppercase hex digits
+  sint32 rssi = 2; // dBm (0 for the link UART)
+  Via via = 3;
+  Chi chi = 4;     // tag the peer beacons, UNSPECIFIED if not yet known
+}
+
+message Lobby {
+  repeated LobbyPeer peers = 1;  // up to 8, strongest first
+  Chi chi = 2;                   // what we offer
+  bool signed = 3;               // a radio key is present
+  TradeState state = 4;          // current trade
+  string peer = 5;               // current trade peer, empty if idle
+}
+
+message Response {
+  uint32 seq = 1;  // echoes HostMsg.seq
+  oneof body {
+    Ack ack = 2;
+    Error error = 3;
+    Pong pong = 4;
+    Info info = 5;
+    ButtonState buttons = 6;
+    GpioLevel gpio = 7;
+    WifiScanResult wifi_scan = 8;
+    WifiState wifi_state = 9;
+    BleScanResult ble_scan = 10;
+    Contacts contacts = 11;
+    BleMetrics ble_metrics = 12;
+    SyncState sync = 13;
+    Lobby lobby = 14;
+  }
+}
+
+// ----------------------------------------------------------------- events ---
+
+message ButtonEvent {
+  Button button = 1;
+  bool pressed = 2;   // true = press, false = release
+  uint64 at_ms = 3;
+}
+
+message ScreenChanged {
+  Screen screen = 1;
+}
+
+// Sent whenever the selected or the currently shown pet mode changes
+// (in AUTO, `active` advances on its own).
+message PetChanged {
+  PetMode selected = 1;  // what the user/host chose (may be AUTO)
+  PetMode active = 2;    // what is animating now (never AUTO)
+}
+
+message TradeEvent {
+  string peer = 1;  // 6 uppercase hex digits
+  TradeState state = 2;
+  Chi chi = 3;      // Chi received, set when COMPLETE
+}
+
+message ContactAdded {
+  Contact contact = 1;
+}
+
+message Event {
+  oneof kind {
+    ButtonEvent button = 1;
+    ScreenChanged screen = 2;
+    PetChanged pet = 3;
+    TradeEvent trade = 4;
+    ContactAdded contact_added = 5;
+  }
+}
+
+message BadgeMsg {
+  oneof kind {
+    Response response = 1;
+    Event event = 2;
+  }
+}

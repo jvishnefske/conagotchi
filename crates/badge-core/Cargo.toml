@@ -1,0 +1,28 @@
+[package]
+name = "badge-core"
+description = "Functional core of the Conagotchi discovery firmware: pure, host-testable state and logic"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+badge-proto.workspace = true
+heapless.workspace = true
+embedded-graphics = "0.8.2"
+# Packet tags of the stock radio protocol (truncated HMAC-SHA256); pure Rust, no_std.
+hmac = { version = "0.12.1", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
+
+[build-dependencies]
+# Host-side QR encoder for the HOME screen bitmap (see build.rs).
+qrcode = { version = "0.14.1", default-features = false }
+
+[dev-dependencies]
+# Decodes the rendered HOME QR code in the ui tests.
+rqrr = "0.11.0"
+
+[features]
+defmt = []
+# Developer build: GPIO probe screen and GpioRead / GpioWrite requests.
+dev = []

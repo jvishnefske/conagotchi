@@ -1,0 +1,6 @@
+/target
+/firmware/target
+# Never commit a real radio key or badge flash dumps.
+radio_key*
+*.bin
+!crates/badge-core/**/fixtures/*.bin

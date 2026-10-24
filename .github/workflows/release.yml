@@ -1,0 +1,95 @@
+# Builds the firmware on a version tag and attaches one merged image to the
+# GitHub release. Flash it with `espflash write-bin 0x0 conagotchi-merged.bin`.
+#
+# The merged image covers only 0x0..(0x10000 + app size), always below
+# 0x200000: bootloader at 0x0, partition table (firmware/partitions.csv) at
+# 0x8000, app at 0x10000, 0xFF in the gaps. `--skip-padding` is essential:
+# without it `save-image --merge` pads the file to the whole flash size
+# (0x800000 with --flash-size 8mb, 0x400000 by default) and write-bin would
+# then erase the conag partition (contacts, imported radio key) at 0x200000
+# and the stock vfs / doom partitions after it.
+#
+# The image contains no radio key: the firmware imports it at runtime from
+# the badge's own vfs partition.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Refuse to release a radio key
+        run: |
+          # Only the fake keys of the littlefs test fixtures may be tracked.
+          bad=$(git ls-files | grep -i 'radio_key' | grep -v '^crates/badge-core/src/lfs/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::radio key files are tracked and must never be released: $bad"
+            exit 1
+          fi
+
+      # Installs the Xtensa Rust fork under the toolchain name used by
+      # firmware/rust-toolchain.toml (`esp-new`). esp-hal 1.2 needs
+      # rustc >= 1.95; 1.97.0.0 is the version the firmware is developed with
+      # (espup 0.17.1, `espup install --name esp-new --toolchain-version 1.97.0.0`).
+      - uses: esp-rs/xtensa-toolchain@ec6d36527049a7f4fb2cb0c1a644668c1bb8a2a4 # v1.7.0
+        with:
+          name: esp-new
+          version: 1.97.0.0
+          buildtargets: esp32s3
+          ldproxy: false
+          override: false
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: firmware
+
+      - name: Install espflash 4.6.0
+        run: |
+          curl -sSfL -o espflash.zip \
+            https://github.com/esp-rs/espflash/releases/download/v4.6.0/espflash-x86_64-unknown-linux-gnu.zip
+          unzip -o espflash.zip -d "$HOME/.cargo/bin"
+          chmod +x "$HOME/.cargo/bin/espflash"
+          espflash --version
+
+      - name: Build firmware
+        working-directory: firmware
+        run: |
+          rustc +esp-new --version
+          cargo +esp-new build --release --locked
+
+      - name: Merge image (bootloader + partition table + app, no padding)
+        run: |
+          espflash save-image --chip esp32s3 --merge --skip-padding \
+            --partition-table firmware/partitions.csv \
+            --flash-size 8mb --flash-mode dio --flash-freq 80mhz \
+            firmware/target/xtensa-esp32s3-none-elf/release/conagotchi-fw \
+            conagotchi-merged.bin
+          size=$(stat -c %s conagotchi-merged.bin)
+          printf 'merged image: %d bytes (ends at 0x%x)\n' "$size" "$size"
+          if [ "$size" -gt $((0x200000)) ]; then
+            echo "::error::merged image reaches 0x200000; it would erase the conag partition"; exit 1
+          fi
+          sha256sum conagotchi-merged.bin > conagotchi-merged.bin.sha256
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            conagotchi-merged.bin
+            conagotchi-merged.bin.sha256
+          fail_on_unmatched_files: true
+          body: |
+            Flash with:
+
+                nix shell nixpkgs#espflash
+                curl -LO https://github.com/jvishnefske/conagotchi/releases/latest/download/conagotchi-merged.bin
+                espflash write-bin 0x0 conagotchi-merged.bin
+
+            The image ends below 0x200000, so the stock vfs (with the radio key) and doom partitions are kept.

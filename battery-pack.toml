@@ -1,0 +1,13 @@
+version = 1
+
+[[battery-pack]]
+name = "embedded"
+features = [
+    "critical-section-impl",
+    "defmt-logging",
+    "embassy",
+    "esp32s3",
+    "panic-probe",
+]
+managed-deps = []
+applied-templates = ["blinky"]

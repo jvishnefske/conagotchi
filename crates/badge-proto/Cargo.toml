@@ -1,0 +1,16 @@
+[package]
+name = "badge-proto"
+description = "Generated no_std protobuf types for the Conagotchi discovery protocol"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+micropb.workspace = true
+heapless.workspace = true
+
+[build-dependencies]
+micropb-gen = "0.6.0"
+protox = "0.10"
+prost = "0.14"
