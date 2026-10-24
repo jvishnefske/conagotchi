@@ -55,8 +55,10 @@
 //! `Input::Host` with `GATT_SEQ`; a bad length or value is rejected with the
 //! matching ATT error. One connection at most: when a central connects the
 //! controller stops advertising, the link is dropped after [`IDLE_TIMEOUT`]
-//! without any ATT request or link event, and advertising resumes within one
-//! [`HOUSEKEEPING`] period after the disconnect.
+//! without any ATT request or link event, or after [`MAX_CONNECTION`] in any
+//! case (traffic cannot extend it, so a central cannot keep the badge off the
+//! air), and advertising resumes within one [`HOUSEKEEPING`] period after the
+//! disconnect.
 //!
 //! If the host runner ever fails, the task keeps answering every BLE command
 //! with `ErrorCode::Radio` so each command still gets exactly one reply.
@@ -123,6 +125,9 @@ pub const SCAN_WINDOW: Duration = Duration::from_millis(30);
 pub const HOUSEKEEPING: Duration = Duration::from_millis(100);
 /// A GATT link without ATT traffic for this long is dropped.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A GATT link is dropped this long after it was accepted, whatever its
+/// traffic: while connected the badge does not advertise (no trade beacon).
+pub const MAX_CONNECTION: Duration = Duration::from_secs(120);
 /// Interval between `Input::BleStats` snapshots.
 const STATS_PERIOD: Duration = Duration::from_secs(1);
 /// Delay before retrying a failed advertising start.
@@ -348,6 +353,8 @@ struct Session<'d, 's> {
     conn: Option<Gatt<'d, 's>>,
     /// Last ATT traffic (or connect) on `conn`.
     last_activity: Instant,
+    /// When `conn` was accepted.
+    connected_at: Instant,
     /// The open `BleScan`: its sequence number and deadline.
     scan: Option<(Option<u32>, Instant)>,
     /// When the next `BleStats` is due.
@@ -390,6 +397,7 @@ async fn serve(stack: &Host<'_>, collector: &Collector, server: Option<&Server<'
         adv_retry_at: now,
         conn: None,
         last_activity: now,
+        connected_at: now,
         scan: None,
         next_stats: now + STATS_PERIOD,
         next_log: now,
@@ -497,17 +505,24 @@ async fn housekeeping<'d, 's>(
                 info!("ble: central connected");
                 s.conn = Some(gatt);
                 s.last_activity = now;
+                s.connected_at = now;
             }
             // `conn` was consumed; dropping the failed result disconnects.
             Some(Err(_)) | None => warn!("ble: central connected without GATT; dropped"),
         }
     }
-    if let Some(conn) = &s.conn
-        && now >= s.last_activity + IDLE_TIMEOUT
-    {
-        info!("ble: idle central, disconnecting");
-        conn.raw().disconnect();
-        s.last_activity = now;
+    if let Some(conn) = &s.conn {
+        if now >= s.connected_at + MAX_CONNECTION {
+            info!("ble: central connected too long, disconnecting");
+            conn.raw().disconnect();
+            // Re-arm so the request is repeated only once per period.
+            s.connected_at = now;
+            s.last_activity = now;
+        } else if now >= s.last_activity + IDLE_TIMEOUT {
+            info!("ble: idle central, disconnecting");
+            conn.raw().disconnect();
+            s.last_activity = now;
+        }
     }
     if let Some((seq, deadline)) = s.scan
         && now >= deadline

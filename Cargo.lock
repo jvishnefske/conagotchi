@@ -174,6 +174,7 @@ dependencies = [
  "rustc-demangle",
  "serde_json",
  "serialport",
+ "tempfile",
  "thiserror",
 ]
 

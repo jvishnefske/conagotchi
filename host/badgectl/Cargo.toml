@@ -16,6 +16,7 @@ probe-rs-espressif = "0.32.0"
 # ROM/stub serial protocol used by `adopt` to back up and write flash.
 espflash = { version = "4.6.0", default-features = false, features = ["serialport"] }
 serialport = { version = "4.7", default-features = false }
+tempfile = "3.27"
 defmt-decoder = "1.2.0"
 clap = { version = "4.6", features = ["derive", "env"] }
 object = { version = "0.37", default-features = false, features = ["read", "std"] }

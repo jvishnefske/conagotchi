@@ -247,11 +247,14 @@ impl Hardware for RealHardware {
 
     fn read_flash(&mut self, badge: Mac, addr: u32, len: u32) -> Result<Vec<u8>> {
         let mut flasher = connect(badge)?;
-        let tmp = std::env::temp_dir().join(format!(
-            "badgectl-{}-{}-{addr:x}.bin",
-            std::process::id(),
-            badge.file_stem()
-        ));
+        // espflash writes the read-back to a path. Use a fresh private
+        // directory (random name, mode 0700, removed on drop) so nobody else
+        // on the machine can predict, pre-create or swap the file.
+        let dir = tempfile::Builder::new()
+            .prefix("badgectl-")
+            .tempdir()
+            .context("creating a private temporary directory")?;
+        let tmp = dir.path().join(format!("{}-{addr:x}.bin", badge.file_stem()));
         eprintln!("  reading {len:#x} bytes at {addr:#x} ...");
         let started = Instant::now();
         let read = flasher.read_flash(addr, len, READ_BLOCK, READ_IN_FLIGHT, tmp.clone());
@@ -260,7 +263,7 @@ impl Hardware for RealHardware {
             std::fs::File::open(&tmp)?.read_to_end(&mut buf)?;
             Ok(buf)
         });
-        let _ = std::fs::remove_file(&tmp);
+        drop(dir);
         let data = data.with_context(|| format!("reading flash {addr:#x}+{len:#x} from {badge}"))?;
         eprintln!("  read {:#x} bytes in {:.1?}", data.len(), started.elapsed());
         // Leave the badge as it was: back to its app.
