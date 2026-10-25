@@ -1,0 +1,23 @@
+[package]
+name = "badge-sim"
+description = "The badge functional core compiled to wasm32 with a C-ABI surface, run by `badgectl sim`"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib: the wasm32 module `badgectl sim` loads. rlib: the record format
+# (`wire`) and the pure shell (`badge`) used and tested on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+badge-core.workspace = true
+badge-proto.workspace = true
+heapless.workspace = true
+embedded-graphics = "0.8.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Interior mutability for the exported statics without `unsafe`: the module
+# is single-threaded, so the lock is never contended.
+spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }

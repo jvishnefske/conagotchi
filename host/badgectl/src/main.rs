@@ -7,6 +7,10 @@
 //! hardware for `adopt` / `restore`), [`logs`] (defmt decoding and printing)
 //! and this file (argument dispatch, Ctrl-C, exit codes).
 //!
+//! [`sim`] runs simulated badges (`badgectl sim`); with `--sim <n>` every
+//! request command talks to badge `n` of a fresh simulation through the
+//! same [`session::Conn`] request path as RTT.
+//!
 //! Exit codes: 0 success, 1 error response or failure, 2 timeout.
 
 mod adopt;
@@ -20,6 +24,7 @@ mod peek;
 mod probe;
 mod request;
 mod session;
+mod sim;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,7 +38,7 @@ use cli::{AdoptArgs, Cli, Command, RequestCmd};
 use logs::{DefmtInfo, Printer};
 use peek::ProbeBlock;
 use probe::ProbeLink;
-use session::{Conn, SessionError, SystemClock};
+use session::{Clock, Conn, Link, SessionError, SystemClock};
 
 /// Set by the Ctrl-C handler; polled by streaming commands.
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -96,6 +101,12 @@ fn load_firmware(cli: &Cli) -> Result<Option<Firmware>> {
 
 fn run(cli: Cli) -> Result<ExitCode> {
     probe::register_espressif();
+    if let Some(badge) = cli.sim {
+        let Command::Request(req) = &cli.command else {
+            return Err(anyhow!("--sim works with request commands; use `badgectl sim` to run a simulation"));
+        };
+        return sim_request(&cli, badge, req);
+    }
     let fw = load_firmware(&cli)?;
     match &cli.command {
         Command::Addr => {
@@ -150,14 +161,124 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Adopt(args) => run_adopt(&cli, fw.as_ref(), args),
         Command::Restore { backup } => run_restore(&cli, backup),
+        Command::Sim(args) => {
+            ctrlc::set_handler(|| STOP.store(true, Ordering::SeqCst)).context("installing Ctrl-C handler")?;
+            sim::run(args, cli.sim_wasm.as_deref(), cli.json, &STOP)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Request(req) => {
             let session = probe::attach(&cli.chip, cli.probe.as_deref())?;
-            if request::is_contacts_all(req) {
-                return all_contacts(&cli, fw.as_ref(), session);
-            }
-            send_request(&cli, fw.as_ref(), session, req)
+            let link = rtt_link(fw.as_ref(), session, cli.timeout)?;
+            let defmt = defmt_info(fw.as_ref());
+            let mut printer = Printer::new(defmt.as_ref(), cli.json);
+            let mut conn = Conn::new(link, SystemClock::default());
+            request_on(&cli, &mut conn, &mut printer, req)
         }
     }
+}
+
+/// `--sim <badge> <request>`: a fresh simulation, warmed up, then the
+/// request over a [`sim::link::SimLink`].
+fn sim_request(cli: &Cli, badge: usize, req: &RequestCmd) -> Result<ExitCode> {
+    if badge >= cli.sim_badges {
+        return Err(anyhow!("--sim {badge}: the simulation has {} badge(s) (--sim-badges)", cli.sim_badges));
+    }
+    let module = sim::load_module(cli.sim_wasm.as_deref())?;
+    let cfg = sim::world::WorldConfig { badges: cli.sim_badges, ..sim::world::WorldConfig::default() };
+    let tick = cfg.tick_ms;
+    let mut world = sim::world::World::new(&module, cfg, sim::bus::LocalBus::new())?;
+    world.run_for(cli.sim_warmup_ms)?;
+    let id = world.node(badge)?.peer_id();
+    eprintln!(
+        "simulated badge {badge} ({}) of {}, after {} ms",
+        id.as_str(),
+        cli.sim_badges,
+        world.now_ms()
+    );
+    let mut printer = Printer::new(None, cli.json);
+    let mut conn = Conn::new(sim::link::SimLink::new(&mut world, badge)?, sim::link::StepClock::new(tick));
+    request_on(cli, &mut conn, &mut printer, req)
+}
+
+/// Maps a request outcome to an exit code (timeouts are 2).
+fn finish<E: std::error::Error + Send + Sync + 'static>(
+    result: Result<badge_proto::Response, SessionError<E>>,
+) -> Result<Result<badge_proto::Response, ExitCode>> {
+    match result {
+        Ok(r) => Ok(Ok(r)),
+        Err(e @ (SessionError::ResponseTimeout { .. } | SessionError::WriteTimeout { .. })) => {
+            eprintln!("error: {e}");
+            Ok(Err(ExitCode::from(2)))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Runs one request command over any link: a single request, the paged
+/// `contacts --all`, or the chunked `wasm load`.
+fn request_on<L: Link, C: Clock>(
+    cli: &Cli,
+    conn: &mut Conn<L, C>,
+    printer: &mut Printer<'_>,
+    req: &RequestCmd,
+) -> Result<ExitCode> {
+    let seq = request::initial_seq(entropy());
+    if request::is_contacts_all(req) {
+        return all_contacts(cli, conn, printer, seq);
+    }
+    if let Some(path) = request::wasm_upload(req) {
+        return wasm_upload(cli, conn, printer, path, seq);
+    }
+    if let Some(samples) = request::adc_scan(req) {
+        return adc_scan(cli, conn, printer, samples, seq);
+    }
+    let msg = request::host_msg(req, seq)?;
+    let resp = match finish(conn.request(&msg, request::timeout_ms(req, cli.timeout), printer))? {
+        Ok(r) => r,
+        Err(code) => return Ok(code),
+    };
+    print_response(cli, &resp);
+    if let Some(hint) = request::hint(req, &resp) {
+        eprintln!("{hint}");
+    }
+    Ok(if format::is_error(&resp) { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// `wasm load <file>`: every chunk in order (stopping at the first error
+/// response), a progress line on stderr, then the runtime status.
+fn wasm_upload<L: Link, C: Clock>(
+    cli: &Cli,
+    conn: &mut Conn<L, C>,
+    printer: &mut Printer<'_>,
+    path: &Path,
+    mut seq: u32,
+) -> Result<ExitCode> {
+    let module = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let chunks = request::wasm_chunks(&module)?;
+    let total = module.len();
+    for chunk in chunks {
+        let end = chunk.offset as usize + chunk.data.len();
+        let msg = badge_proto::HostMsg { seq, cmd: Some(badge_proto::HostMsg_::Cmd::WasmLoad(chunk)) };
+        seq = request::next_seq(seq);
+        let resp = match finish(conn.request(&msg, cli.timeout, printer))? {
+            Ok(r) => r,
+            Err(code) => return Ok(code),
+        };
+        if format::is_error(&resp) {
+            eprintln!();
+            print_response(cli, &resp);
+            return Ok(ExitCode::from(1));
+        }
+        eprint!("\rloading {}: {end}/{total} bytes", path.display());
+    }
+    eprintln!();
+    let status = badge_proto::HostMsg { seq, cmd: Some(badge_proto::HostMsg_::Cmd::GetWasm(badge_proto::GetWasm {})) };
+    let resp = match finish(conn.request(&status, cli.timeout, printer))? {
+        Ok(r) => r,
+        Err(code) => return Ok(code),
+    };
+    print_response(cli, &resp);
+    Ok(if format::is_error(&resp) { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 /// Resolves the image `adopt` installs.
@@ -225,13 +346,13 @@ fn run_restore(cli: &Cli, backup: &Path) -> Result<ExitCode> {
 }
 
 /// `contacts --all`: requests pages until the badge's total is reached.
-fn all_contacts(cli: &Cli, fw: Option<&Firmware>, session: probe_rs::Session) -> Result<ExitCode> {
+fn all_contacts<L: Link, C: Clock>(
+    cli: &Cli,
+    conn: &mut Conn<L, C>,
+    printer: &mut Printer<'_>,
+    mut seq: u32,
+) -> Result<ExitCode> {
     use badge_proto::Response_::Body;
-    let mut seq = request::initial_seq(entropy());
-    let link = rtt_link(fw, session, cli.timeout)?;
-    let defmt = defmt_info(fw);
-    let mut printer = Printer::new(defmt.as_ref(), cli.json);
-    let mut conn = Conn::new(link, SystemClock::default());
     let mut contacts = Vec::new();
     let mut total = 0;
     let mut offset = 0;
@@ -239,13 +360,9 @@ fn all_contacts(cli: &Cli, fw: Option<&Firmware>, session: probe_rs::Session) ->
         let req = request::contacts_at(offset);
         let msg = request::host_msg(&req, seq)?;
         seq = request::next_seq(seq);
-        let resp = match conn.request(&msg, request::timeout_ms(&req, cli.timeout), &mut printer) {
+        let resp = match finish(conn.request(&msg, request::timeout_ms(&req, cli.timeout), printer))? {
             Ok(r) => r,
-            Err(e @ (SessionError::ResponseTimeout { .. } | SessionError::WriteTimeout { .. })) => {
-                eprintln!("error: {e}");
-                return Ok(ExitCode::from(2));
-            }
-            Err(e) => return Err(e.into()),
+            Err(code) => return Ok(code),
         };
         let Some(Body::Contacts(page)) = &resp.body else {
             print_response(cli, &resp);
@@ -262,6 +379,33 @@ fn all_contacts(cli: &Cli, fw: Option<&Firmware>, session: probe_rs::Session) ->
         println!("{}", serde_json::json!({ "kind": "response", "body": format::contacts_json(&contacts, 0, total) }));
     } else {
         println!("{}", format::contacts_text(&contacts, 0, total));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `adc scan`: one `AdcRead` per ADC1 probe pin; stops at the first error.
+fn adc_scan<L: Link, C: Clock>(
+    cli: &Cli,
+    conn: &mut Conn<L, C>,
+    printer: &mut Printer<'_>,
+    samples: u32,
+    mut seq: u32,
+) -> Result<ExitCode> {
+    for pin in request::ADC_SCAN_PINS {
+        let msg = badge_proto::HostMsg { seq, cmd: Some(request::adc_read(pin, samples)) };
+        seq = request::next_seq(seq);
+        let resp = match finish(conn.request(&msg, cli.timeout, printer))? {
+            Ok(r) => r,
+            Err(code) => return Ok(code),
+        };
+        print_response(cli, &resp);
+        if format::is_error(&resp) {
+            let req = RequestCmd::Adc { op: cli::AdcCmd::Scan { samples } };
+            if let Some(hint) = request::hint(&req, &resp) {
+                eprintln!("{hint}");
+            }
+            return Ok(ExitCode::from(1));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -322,29 +466,6 @@ fn stream(cli: &Cli, fw: Option<&Firmware>, session: probe_rs::Session, wait_ms:
     eprintln!("streaming; Ctrl-C to stop");
     conn.stream(&mut printer, || STOP.load(Ordering::SeqCst))?;
     Ok(ExitCode::SUCCESS)
-}
-
-fn send_request(cli: &Cli, fw: Option<&Firmware>, session: probe_rs::Session, req: &RequestCmd) -> Result<ExitCode> {
-    let seq = request::initial_seq(entropy());
-    let msg = request::host_msg(req, seq)?;
-    let link = rtt_link(fw, session, cli.timeout)?;
-    let defmt = defmt_info(fw);
-    let mut printer = Printer::new(defmt.as_ref(), cli.json);
-    let mut conn = Conn::new(link, SystemClock::default());
-    match conn.request(&msg, request::timeout_ms(req, cli.timeout), &mut printer) {
-        Ok(resp) => {
-            print_response(cli, &resp);
-            if let Some(hint) = request::hint(req, &resp) {
-                eprintln!("{hint}");
-            }
-            Ok(if format::is_error(&resp) { ExitCode::from(1) } else { ExitCode::SUCCESS })
-        }
-        Err(e @ (SessionError::ResponseTimeout { .. } | SessionError::WriteTimeout { .. })) => {
-            eprintln!("error: {e}");
-            Ok(ExitCode::from(2))
-        }
-        Err(e) => Err(e.into()),
-    }
 }
 
 /// Process-specific entropy for the first sequence number.

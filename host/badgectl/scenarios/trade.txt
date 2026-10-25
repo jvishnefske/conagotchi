@@ -1,0 +1,14 @@
+# Two simulated badges trade Chi and sync their LEDs.
+# Run: badgectl sim --script host/badgectl/scenarios/trade.txt --events
+# Lines: <at_ms> <badge> <badgectl request...>; @N is badge N's peer id.
+
+# Badge 1 offers CRY (badge 0 keeps the default VIB).
+1500 1 chi cry
+# Both people pick each other in the lobby (the stock rule: both invite).
+3000 0 trade invite @1
+3200 1 trade invite @0
+# Afterwards: the lobby, the contacts and the LED sync state of each.
+9000 0 lobby
+9000 1 contacts
+9500 0 sync
+9500 1 sync

@@ -31,6 +31,19 @@ pub struct Cli {
     /// Print responses and events as JSON lines.
     #[arg(long, global = true)]
     pub json: bool,
+    /// Send the request to badge N of a fresh simulation instead of a probe
+    /// (see `badgectl sim`); the simulation runs `--sim-warmup-ms` first.
+    #[arg(long, global = true, value_name = "N")]
+    pub sim: Option<usize>,
+    /// Badges in the `--sim` simulation.
+    #[arg(long, global = true, default_value_t = 2)]
+    pub sim_badges: usize,
+    /// Simulated time to run before a `--sim` request (lobby and sync settle).
+    #[arg(long, global = true, default_value_t = 3000)]
+    pub sim_warmup_ms: u64,
+    /// badge-sim wasm module to run instead of the one built into badgectl.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub sim_wasm: Option<PathBuf>,
     /// What to do.
     #[command(subcommand)]
     pub command: Command,
@@ -69,9 +82,60 @@ pub enum Command {
         /// Backup file (`~/.local/share/conagotchi/backups/<mac>.bin`).
         backup: PathBuf,
     },
+    /// Run simulated badges (the badge core as wasm) talking over a
+    /// middleware bus.
+    Sim(SimArgs),
     /// Protocol requests sent over RTT.
     #[command(flatten)]
     Request(RequestCmd),
+}
+
+/// Options of `sim`.
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct SimArgs {
+    /// Number of simulated badges.
+    #[arg(long, default_value_t = 2)]
+    pub badges: usize,
+    /// Simulated run time in ms (0 = until Ctrl-C).
+    #[arg(long, default_value_t = 10_000)]
+    pub duration_ms: u64,
+    /// Pace the simulation to wall-clock time.
+    #[arg(long)]
+    pub realtime: bool,
+    /// Print every message the badges send (events, responses).
+    #[arg(long)]
+    pub events: bool,
+    /// Write each badge's screen as PNG into this directory.
+    #[arg(long, value_name = "DIR")]
+    pub png: Option<PathBuf>,
+    /// Minimum simulated time between two PNGs of one badge.
+    #[arg(long, default_value_t = 1000)]
+    pub png_every_ms: u64,
+    /// Scenario: lines of `<at_ms> <badge> <request...>` (`@N` = badge N's id).
+    #[arg(long, value_name = "FILE")]
+    pub script: Option<PathBuf>,
+    /// Load and start this wasm app on every badge right after boot.
+    #[arg(long, value_name = "FILE")]
+    pub app: Option<PathBuf>,
+    /// Extra app keys every badge subscribes to (keys only remote processes
+    /// publish on).
+    #[arg(long = "app-key", value_name = "KEY")]
+    pub app_keys: Vec<String>,
+    /// MAC of badge 0 minus one, hex (use distinct bases per process with --zenoh).
+    #[arg(long, value_parser = parse_u64, default_value = "0x0200c0ffee00")]
+    pub mac_base: u64,
+    /// Boot delay between consecutive badges (their clocks differ by this).
+    #[arg(long, default_value_t = 1234)]
+    pub stagger_ms: u64,
+    /// RSSI of simulated BLE receptions (the lobby ignores below -55).
+    #[arg(long, default_value_t = -40, allow_negative_numbers = true)]
+    pub rssi: i8,
+    /// Connect the bus to this Zenoh endpoint (e.g. tcp/127.0.0.1:7447).
+    #[arg(long, value_name = "ENDPOINT")]
+    pub zenoh: Vec<String>,
+    /// Listen for Zenoh peers on this endpoint.
+    #[arg(long, value_name = "ENDPOINT")]
+    pub zenoh_listen: Vec<String>,
 }
 
 /// Requests that become one `HostMsg` and wait for one `Response`.
@@ -202,6 +266,54 @@ pub enum RequestCmd {
     },
     /// LED sync state (leader, offset, peers).
     Sync,
+    /// The on-badge wasm app.
+    Wasm {
+        /// Operation.
+        #[command(subcommand)]
+        op: WasmOp,
+    },
+    /// Sample ADC1-capable probe pins (dev firmware), e.g. to look for a
+    /// battery voltage divider.
+    Adc {
+        /// Operation.
+        #[command(subcommand)]
+        op: AdcCmd,
+    },
+}
+
+/// `adc` operations.
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum AdcCmd {
+    /// Sample one pin (GPIO 1, 3, 5, 6, 7 or 8).
+    Read {
+        /// GPIO number.
+        pin: u32,
+        /// Samples to average (1..=64; default 16).
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
+        samples: u32,
+    },
+    /// Sample every ADC1 probe pin, one line each.
+    Scan {
+        /// Samples to average per pin (1..=64; default 16).
+        #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
+        samples: u32,
+    },
+}
+
+/// `wasm` operations.
+#[derive(Debug, Clone, PartialEq, Subcommand)]
+pub enum WasmOp {
+    /// Upload a module (chunked `WasmLoad`), then print the runtime status.
+    Load {
+        /// The `.wasm` file (at most 16 KiB).
+        file: PathBuf,
+    },
+    /// Instantiate the loaded module and start ticking it.
+    Start,
+    /// Stop the app (the module stays loaded).
+    Stop,
+    /// Runtime state, module size, ticks and fuel.
+    Status,
 }
 
 /// `trade` operations.
@@ -598,6 +710,46 @@ mod tests {
         };
         assert_eq!(backup, PathBuf::from("b.bin"));
         assert!(parse(&["restore"]).is_err());
+    }
+
+    #[test]
+    fn adc_parse() {
+        assert!(matches!(
+            parse(&["adc", "read", "3"]),
+            Ok(Command::Request(RequestCmd::Adc { op: AdcCmd::Read { pin: 3, samples: 16 } }))
+        ));
+        assert!(matches!(
+            parse(&["adc", "scan", "--samples", "64"]),
+            Ok(Command::Request(RequestCmd::Adc { op: AdcCmd::Scan { samples: 64 } }))
+        ));
+        assert!(parse(&["adc", "scan", "--samples", "65"]).is_err());
+        assert!(parse(&["adc", "read"]).is_err());
+    }
+
+    #[test]
+    fn wasm_and_sim_parse() {
+        let Ok(Command::Request(RequestCmd::Wasm { op: WasmOp::Load { file } })) = parse(&["wasm", "load", "a.wasm"])
+        else {
+            panic!("wasm load")
+        };
+        assert_eq!(file, PathBuf::from("a.wasm"));
+        for (name, want) in [("start", WasmOp::Start), ("stop", WasmOp::Stop), ("status", WasmOp::Status)] {
+            assert!(matches!(parse(&["wasm", name]), Ok(Command::Request(RequestCmd::Wasm { op })) if op == want));
+        }
+        assert!(parse(&["wasm", "load"]).is_err());
+        let Ok(Command::Sim(a)) = parse(&["sim"]) else { panic!("sim") };
+        assert_eq!((a.badges, a.duration_ms, a.rssi, a.mac_base), (2, 10_000, -40, 0x0200_c0ff_ee00));
+        assert!(!a.realtime && !a.events && a.zenoh.is_empty());
+        let Ok(Command::Sim(a)) =
+            parse(&["sim", "--badges", "3", "--rssi", "-50", "--zenoh", "tcp/127.0.0.1:7447", "--app-key", "app/x"])
+        else {
+            panic!("sim opts")
+        };
+        assert_eq!((a.badges, a.rssi), (3, -50));
+        assert_eq!(a.zenoh, ["tcp/127.0.0.1:7447"]);
+        assert_eq!(a.app_keys, ["app/x"]);
+        let cli = Cli::try_parse_from(["badgectl", "--sim", "1", "lobby"]).unwrap();
+        assert_eq!((cli.sim, cli.sim_badges, cli.sim_warmup_ms), (Some(1), 2, 3000));
     }
 
     #[test]

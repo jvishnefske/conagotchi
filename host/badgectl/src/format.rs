@@ -9,7 +9,8 @@ use std::fmt::Write as _;
 
 use badge_proto::{
     AccessPoint, BleDevice, BleMetrics, Button, ButtonState, Chi, Contact, ErrorCode, Event, Event_, Info,
-    LedPattern, Lobby, PetMode, Response, Response_::Body, Screen, SyncState, TradeState, Via, WifiState,
+    LedPattern, Lobby, PetMode, Response, Response_::Body, Screen, SyncState, TradeState, Via, WasmState,
+    WasmStatus, WifiState,
 };
 use serde_json::{Value, json};
 
@@ -89,6 +90,42 @@ pub fn via_name(v: Via) -> String {
         Via::Link => "LINK".into(),
         Via(n) => format!("VIA({n})"),
     }
+}
+
+/// Name of a `WasmState` value.
+pub fn wasm_state_name(w: WasmState) -> String {
+    match w {
+        WasmState::Empty => "EMPTY".into(),
+        WasmState::Loading => "LOADING".into(),
+        WasmState::Loaded => "LOADED".into(),
+        WasmState::Running => "RUNNING".into(),
+        WasmState::Trapped => "TRAPPED".into(),
+        WasmState(n) => format!("WASM_STATE({n})"),
+    }
+}
+
+/// Human-readable wasm runtime status (one line, plus the error if any).
+pub fn wasm_status_text(w: &WasmStatus) -> String {
+    let mut out = format!(
+        "wasm {} size {} B, {} tick(s), {} fuel",
+        wasm_state_name(w.state),
+        w.size,
+        w.ticks,
+        w.fuel_used
+    );
+    if !w.error.is_empty() {
+        let _ = write!(out, "\nerror: {}", w.error);
+    }
+    out
+}
+
+/// JSON body of a wasm runtime status.
+pub fn wasm_status_json(w: &WasmStatus) -> Value {
+    json!({
+        "type": "wasm", "state": wasm_state_name(w.state), "state_value": w.state.0,
+        "size": w.size, "fuel_used": w.fuel_used, "ticks": w.ticks,
+        "error": if w.error.is_empty() { Value::Null } else { Value::from(w.error.as_str()) },
+    })
 }
 
 /// A peer id string, or `-` when empty.
@@ -330,6 +367,20 @@ fn lobby_text(l: &Lobby) -> String {
     out
 }
 
+/// One ADC reading: mean, spread and sample count. A spread of a few mV
+/// suggests a driven node (e.g. a divider); a large spread a floating pin.
+pub fn adc_text(a: &badge_proto::AdcLevel) -> String {
+    format!(
+        "GPIO{} = {} mV (min {} max {}, spread {} mV, {} samples)",
+        a.pin,
+        a.millivolts,
+        a.min_mv,
+        a.max_mv,
+        a.max_mv.saturating_sub(a.min_mv),
+        a.samples
+    )
+}
+
 /// Human-readable rendering of a response body.
 pub fn response_text(r: &Response) -> String {
     match &r.body {
@@ -340,6 +391,7 @@ pub fn response_text(r: &Response) -> String {
         Some(Body::Pong(p)) => format!("pong nonce={} uptime={} ({} ms)", p.nonce, uptime(p.uptime_ms), p.uptime_ms),
         Some(Body::Info(i)) => info_text(i),
         Some(Body::Buttons(b)) => buttons_text(b),
+        Some(Body::Adc(a)) => adc_text(a),
         Some(Body::Gpio(g)) => {
             format!("GPIO{} = {} ({})", g.pin, u8::from(g.level), if g.level { "high" } else { "low" })
         }
@@ -350,6 +402,7 @@ pub fn response_text(r: &Response) -> String {
         Some(Body::BleMetrics(m)) => ble_metrics_text(m),
         Some(Body::Sync(s)) => sync_text(s),
         Some(Body::Lobby(l)) => lobby_text(l),
+        Some(Body::Wasm(w)) => wasm_status_text(w),
     }
 }
 
@@ -390,6 +443,7 @@ pub fn event_text(e: &Event) -> String {
             ),
             None => "event: contact added (empty)".into(),
         },
+        Some(Event_::Kind::WasmLog(l)) => format!("event: wasm log: {}", l.text.as_str()),
         None => "event: (empty)".into(),
     }
 }
@@ -414,6 +468,10 @@ pub fn response_json(r: &Response) -> Value {
             "press_counts": b.press_counts.as_slice(),
         }),
         Some(Body::Gpio(g)) => json!({ "type": "gpio", "pin": g.pin, "level": g.level }),
+        Some(Body::Adc(a)) => json!({
+            "type": "adc", "pin": a.pin, "millivolts": a.millivolts, "min_mv": a.min_mv,
+            "max_mv": a.max_mv, "samples": a.samples,
+        }),
         Some(Body::WifiScan(s)) => json!({
             "type": "wifi_scan",
             "aps": s.aps.iter().map(|a| json!({
@@ -450,6 +508,7 @@ pub fn response_json(r: &Response) -> Value {
                 "chi": chi_name(p.chi), "chi_value": p.chi.0,
             })).collect::<Vec<_>>(),
         }),
+        Some(Body::Wasm(w)) => wasm_status_json(w),
     };
     json!({ "kind": "response", "seq": r.seq, "body": body })
 }
@@ -476,6 +535,7 @@ pub fn event_json(e: &Event) -> Value {
             "type": "contact_added",
             "contact": c.contact.as_ref().map_or(Value::Null, contact_json),
         }),
+        Some(Event_::Kind::WasmLog(l)) => json!({ "type": "wasm_log", "text": l.text.as_str() }),
         None => json!({ "type": "empty" }),
     };
     json!({ "kind": "event", "body": body })
@@ -603,6 +663,12 @@ mod tests {
             "pong nonce=7 uptime=1.500s (1500 ms)"
         );
         assert_eq!(response_text(&resp(Body::Gpio(GpioLevel { pin: 5, level: true }))), "GPIO5 = 1 (high)");
+        let adc = badge_proto::AdcLevel { pin: 3, millivolts: 1850, min_mv: 1846, max_mv: 1853, samples: 16 };
+        assert_eq!(
+            response_text(&resp(Body::Adc(adc))),
+            "GPIO3 = 1850 mV (min 1846 max 1853, spread 7 mV, 16 samples)"
+        );
+        assert_eq!(response_json(&resp(Body::Adc(adc)))["body"]["millivolts"], 1850);
         assert_eq!(response_text(&Response { seq: 3, body: None }), "empty response (seq 3)");
     }
 
@@ -842,6 +908,33 @@ mod tests {
         let none = Event { kind: Some(Event_::Kind::ContactAdded(badge_proto::ContactAdded { contact: None })) };
         assert_eq!(event_text(&none), "event: contact added (empty)");
         assert_eq!(event_json(&none)["body"]["contact"], Value::Null);
+    }
+
+    #[test]
+    fn wasm_status_and_log() {
+        let w = WasmStatus { state: WasmState::Running, size: 1234, fuel_used: 99, ticks: 7, error: hs("") };
+        assert_eq!(response_text(&resp(Body::Wasm(w.clone()))), "wasm RUNNING size 1234 B, 7 tick(s), 99 fuel");
+        let j = response_json(&resp(Body::Wasm(w)));
+        assert_eq!(j["body"]["type"], "wasm");
+        assert_eq!(j["body"]["state"], "RUNNING");
+        assert_eq!(j["body"]["state_value"], 3);
+        assert_eq!(j["body"]["size"], 1234);
+        assert_eq!(j["body"]["fuel_used"], 99);
+        assert_eq!(j["body"]["ticks"], 7);
+        assert_eq!(j["body"]["error"], Value::Null);
+        let t = WasmStatus { state: WasmState::Trapped, error: hs("out of fuel"), ..WasmStatus::default() };
+        let text = response_text(&resp(Body::Wasm(t.clone())));
+        assert!(text.starts_with("wasm TRAPPED size 0 B") && text.ends_with("\nerror: out of fuel"), "{text}");
+        assert_eq!(response_json(&resp(Body::Wasm(t)))["body"]["error"], "out of fuel");
+        assert_eq!(wasm_state_name(WasmState::Empty), "EMPTY");
+        assert_eq!(wasm_state_name(WasmState::Loading), "LOADING");
+        assert_eq!(wasm_state_name(WasmState::Loaded), "LOADED");
+        assert_eq!(wasm_state_name(WasmState(9)), "WASM_STATE(9)");
+        let log = Event { kind: Some(Event_::Kind::WasmLog(badge_proto::WasmLog { text: hs("hi there") })) };
+        assert_eq!(event_text(&log), "event: wasm log: hi there");
+        let j = event_json(&log);
+        assert_eq!(j["body"]["type"], "wasm_log");
+        assert_eq!(j["body"]["text"], "hi there");
     }
 
     #[test]

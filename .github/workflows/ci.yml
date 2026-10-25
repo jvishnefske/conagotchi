@@ -1,5 +1,7 @@
 # Host workspace: tests and clippy, with and without the developer feature
-# (`badge-core/dev`: GPIO probe requests and screen).
+# (`badge-core/dev`: GPIO probe requests and screen). badgectl's build script
+# builds the simulator module (crates/badge-sim) for wasm32, so every job
+# needs the wasm32-unknown-unknown target.
 name: ci
 
 on:
@@ -23,7 +25,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
       - name: Toolchain (rust-toolchain.toml pins stable)
         run: |
-          rustup toolchain install stable --profile minimal --component clippy
+          rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
           rustc --version
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -32,3 +34,45 @@ jobs:
         run: cargo test --workspace --locked ${{ matrix.features }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+
+  # The simulator module and the wasm apps, built for wasm32 on their own
+  # (badgectl embeds the module, but this checks the wasm32 build and lints
+  # it for the target it runs on).
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: wasm
+      - name: badge-sim for wasm32
+        run: cargo build -p badge-sim --release --locked --target wasm32-unknown-unknown
+      - name: badge-sim clippy for wasm32
+        run: cargo clippy -p badge-sim --locked --target wasm32-unknown-unknown -- -D warnings
+      - name: Wasm apps (committed apps/*.wasm must match a fresh build)
+        run: scripts/build-apps.sh --check
+
+  # `badgectl sim --zenoh`: the middleware's Zenoh backend. The test uses an
+  # isolated session (no endpoints, scouting off); the loopback test that
+  # listens on 127.0.0.1 is #[ignore]d.
+  sim-zenoh:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: System libraries for probe-rs
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
+          rustc --version
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: zenoh
+      - name: Test
+        run: cargo test -p badgectl --features zenoh --locked
+      - name: Clippy
+        run: cargo clippy -p badgectl --all-targets --features zenoh --locked -- -D warnings

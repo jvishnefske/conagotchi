@@ -3,7 +3,7 @@
 #
 # Host workspace: tests and clippy (-D warnings), without and with
 # `--features badge-core/dev`, plus the no_std build of badge-core for
-# thumbv7em-none-eabihf. Firmware: release build and clippy, default and
+# thumbv7em-none-eabihf; badge-sim for wasm32 and apps/hello.wasm freshness. Firmware: release build and clippy, default and
 # `--features dev`, using the esp toolchain from ~/export-esp-new.sh.
 #
 # Environment:
@@ -39,6 +39,10 @@ done
 step "badge-core no_std build (thumbv7em-none-eabihf)"
 cargo +stable build -p badge-core --target thumbv7em-none-eabihf
 cargo +stable build -p badge-core --target thumbv7em-none-eabihf --features dev
+
+step "wasm: badge-sim for wasm32 and the committed demo app is current"
+cargo +stable build -p badge-sim --target wasm32-unknown-unknown --release
+scripts/build-apps.sh --check
 
 esp_export="${ESP_EXPORT:-$HOME/export-esp-new.sh}"
 if [[ "${SKIP_FIRMWARE:-0}" == "1" ]]; then

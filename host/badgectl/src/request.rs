@@ -4,7 +4,8 @@
 //! subcommand, [`timeout_ms`] picks how long to wait for its response, and
 //! [`poke_words`] maps a `poke` subcommand onto the PROBE mailbox words.
 //! [`next_contacts_offset`] drives `contacts --all` paging and [`hint`]
-//! explains error responses that have a known cause.
+//! explains error responses that have a known cause. [`wasm_chunks`] splits
+//! a module into the `WasmLoad` requests of `wasm load`.
 //! Capacity limits of the generated types are checked here so the user gets
 //! a clear message instead of a silently truncated field.
 
@@ -12,16 +13,16 @@ use badge_core::color::Color;
 use badge_core::probe_layout::mailbox;
 use badge_core::oz::PeerId;
 use badge_proto::{
-    BleAdvertise, BleScan, Chi, ClearContacts, Contacts, DisplayFill, DisplayRect, DisplayText, ErrorCode,
+    AdcRead, BleAdvertise, BleScan, Chi, ClearContacts, Contacts, DisplayFill, DisplayRect, DisplayText, ErrorCode,
     GetBleMetrics, GetButtons, GetInfo, GetLobby, GetSync, GpioRead, GpioWrite, HostMsg, HostMsg_::Cmd,
     Indicator, LedPattern, ListContacts, PetMode, Ping, Response, Response_::Body, Rgb, Screen, SetChi,
-    SetIndicator, SetLed, SetLeds, SetPattern, SetPetMode, ShowScreen, TradeCancel, TradeInvite, WifiConnect,
-    WifiScan, WifiStatus,
+    SetIndicator, SetLed, SetLeds, SetPattern, SetPetMode, ShowScreen, TradeCancel, TradeInvite, WasmLoad,
+    WasmStart, WasmStop, GetWasm, WifiConnect, WifiScan, WifiStatus,
 };
 
-use crate::cli::{
+use crate::cli::{AdcCmd, 
     BleCmd, ChiArg, ContactsCmd, GpioCmd, IndicatorArg, OnOff, PatternArg, PetArg, PokeCmd, RequestCmd,
-    ScreenArg, TradeCmd, WifiCmd,
+    ScreenArg, TradeCmd, WasmOp, WifiCmd,
 };
 
 /// Minimum wait for requests that run a radio scan or join a network.
@@ -43,6 +44,51 @@ pub enum RequestError {
     /// `leds` needs between 1 and 8 colours.
     #[error("expected 1 to 8 colours, got {0}")]
     LedCount(usize),
+    /// `wasm load` is several requests; see [`wasm_chunks`].
+    #[error("`wasm load` is an upload of several requests, not one")]
+    Upload,
+    /// The module is empty.
+    #[error("the wasm module is empty")]
+    EmptyModule,
+    /// The module exceeds what the badge accepts.
+    #[error("the wasm module is {len} bytes; the badge accepts at most {max}")]
+    ModuleTooLarge {
+        /// Module size.
+        len: usize,
+        /// Limit.
+        max: usize,
+    },
+}
+
+/// Bytes per `WasmLoad` chunk (the protocol capacity of `WasmLoad.data`).
+pub const WASM_CHUNK: usize = badge_core::io::WASM_CHUNK;
+
+/// Splits a module into in-order `WasmLoad` chunks of [`WASM_CHUNK`] bytes
+/// (the last one shorter), each carrying the full size.
+///
+/// # Errors
+///
+/// [`RequestError::EmptyModule`], or [`RequestError::ModuleTooLarge`] above
+/// `wasm_abi::MAX_MODULE` (checked here so nothing is sent).
+pub fn wasm_chunks(module: &[u8]) -> Result<Vec<WasmLoad>, RequestError> {
+    let max = wasm_abi::MAX_MODULE;
+    if module.is_empty() {
+        return Err(RequestError::EmptyModule);
+    }
+    let too_large = RequestError::ModuleTooLarge { len: module.len(), max };
+    if module.len() > max {
+        return Err(too_large);
+    }
+    let total = u32::try_from(module.len()).map_err(|_| too_large.clone())?;
+    module
+        .chunks(WASM_CHUNK)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let offset = u32::try_from(i * WASM_CHUNK).map_err(|_| too_large.clone())?;
+            let data = heapless::Vec::from_slice(chunk).map_err(|_| too_large.clone())?;
+            Ok(WasmLoad { offset, data, total })
+        })
+        .collect()
 }
 
 fn rgb(c: Color) -> Rgb {
@@ -161,6 +207,8 @@ pub fn command(req: &RequestCmd, seq: u32) -> Result<Cmd, RequestError> {
             color: Some(rgb(*color)),
         }),
         RequestCmd::Gpio { op: GpioCmd::Read { pin } } => Cmd::GpioRead(GpioRead { pin: *pin }),
+        RequestCmd::Adc { op: AdcCmd::Read { pin, samples } } => adc_read(*pin, *samples),
+        RequestCmd::Adc { op: AdcCmd::Scan { samples } } => adc_read(ADC_SCAN_PINS[0], *samples),
         RequestCmd::Gpio { op: GpioCmd::Write { pin, level } } => {
             Cmd::GpioWrite(GpioWrite { pin: *pin, level: *level != 0 })
         }
@@ -187,6 +235,10 @@ pub fn command(req: &RequestCmd, seq: u32) -> Result<Cmd, RequestError> {
         RequestCmd::Contacts { op: Some(ContactsCmd::Clear), .. } => Cmd::ClearContacts(ClearContacts {}),
         RequestCmd::Contacts { op: None, offset, .. } => Cmd::ListContacts(ListContacts { offset: *offset }),
         RequestCmd::Sync => Cmd::GetSync(GetSync {}),
+        RequestCmd::Wasm { op: WasmOp::Load { .. } } => return Err(RequestError::Upload),
+        RequestCmd::Wasm { op: WasmOp::Start } => Cmd::WasmStart(WasmStart {}),
+        RequestCmd::Wasm { op: WasmOp::Stop } => Cmd::WasmStop(WasmStop {}),
+        RequestCmd::Wasm { op: WasmOp::Status } => Cmd::GetWasm(GetWasm {}),
     })
 }
 
@@ -239,6 +291,30 @@ pub fn next_contacts_offset(page: &Contacts) -> Option<u32> {
     (next < page.total).then_some(next)
 }
 
+/// The module path if `req` is `wasm load`.
+pub fn wasm_upload(req: &RequestCmd) -> Option<&std::path::Path> {
+    match req {
+        RequestCmd::Wasm { op: WasmOp::Load { file } } => Some(file),
+        _ => None,
+    }
+}
+
+/// Pins `adc scan` samples, in order (badge-core `board::ADC_PINS`).
+pub const ADC_SCAN_PINS: [u32; 6] = [1, 3, 5, 6, 7, 8];
+
+/// An `AdcRead` request.
+pub fn adc_read(pin: u32, samples: u32) -> Cmd {
+    Cmd::AdcRead(AdcRead { pin, samples })
+}
+
+/// `Some(samples)` if `req` is `adc scan`.
+pub fn adc_scan(req: &RequestCmd) -> Option<u32> {
+    match req {
+        RequestCmd::Adc { op: AdcCmd::Scan { samples } } => Some(*samples),
+        _ => None,
+    }
+}
+
 /// True if `req` is `contacts --all` (paged listing).
 pub fn is_contacts_all(req: &RequestCmd) -> bool {
     matches!(req, RequestCmd::Contacts { op: None, all: true, .. })
@@ -252,10 +328,14 @@ pub fn contacts_at(offset: u32) -> RequestCmd {
 /// A hint to print under an error response whose cause is known.
 pub fn hint(req: &RequestCmd, resp: &Response) -> Option<&'static str> {
     match (req, &resp.body) {
-        (RequestCmd::Gpio { .. }, Some(Body::Error(e))) if e.code == ErrorCode::Unsupported => Some(
+        (RequestCmd::Gpio { .. } | RequestCmd::Adc { .. }, Some(Body::Error(e)))
+            if e.code == ErrorCode::Unsupported =>
+        {
+            Some(
             "hint: the GPIO probe is only built into development firmware; \
              rebuild it with `cargo build --release --features dev` and reflash",
-        ),
+            )
+        }
         _ => None,
     }
 }
@@ -293,6 +373,45 @@ mod tests {
 
     fn cmd(args: &[&str]) -> Cmd {
         command(&parse(args), 42).expect("command")
+    }
+
+    #[test]
+    fn wasm_chunks_cover_the_module_in_order() {
+        let module: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let chunks = wasm_chunks(&module).unwrap();
+        assert_eq!(chunks.len(), 6);
+        for (i, c) in chunks.iter().enumerate() {
+            assert_eq!(c.offset as usize, i * WASM_CHUNK);
+            assert_eq!(c.total, 1000);
+        }
+        assert!(chunks[..5].iter().all(|c| c.data.len() == 192));
+        assert_eq!(chunks[5].data.len(), 1000 - 5 * 192, "last chunk is partial");
+        let joined: Vec<u8> = chunks.iter().flat_map(|c| c.data.iter().copied()).collect();
+        assert_eq!(joined, module);
+        let exact = wasm_chunks(&[7; 384]).unwrap();
+        assert_eq!((exact.len(), exact[1].offset, exact[1].data.len()), (2, 192, 192));
+        assert_eq!(wasm_chunks(&[1]).unwrap()[0].data.as_slice(), &[1]);
+    }
+
+    #[test]
+    fn wasm_modules_over_16k_or_empty_are_refused_locally() {
+        assert_eq!(wasm_chunks(&[]), Err(RequestError::EmptyModule));
+        assert_eq!(wasm_chunks(&vec![0; 16 * 1024]).map(|c| c.len()), Ok(86));
+        assert_eq!(
+            wasm_chunks(&vec![0; 16 * 1024 + 1]),
+            Err(RequestError::ModuleTooLarge { len: 16 * 1024 + 1, max: 16 * 1024 })
+        );
+    }
+
+    #[test]
+    fn wasm_requests() {
+        assert_eq!(cmd(&["wasm", "start"]), Cmd::WasmStart(WasmStart {}));
+        assert_eq!(cmd(&["wasm", "stop"]), Cmd::WasmStop(WasmStop {}));
+        assert_eq!(cmd(&["wasm", "status"]), Cmd::GetWasm(GetWasm {}));
+        let load = parse(&["wasm", "load", "x.wasm"]);
+        assert_eq!(command(&load, 1), Err(RequestError::Upload));
+        assert_eq!(wasm_upload(&load), Some(std::path::Path::new("x.wasm")));
+        assert_eq!(wasm_upload(&parse(&["info"])), None);
     }
 
     #[test]
