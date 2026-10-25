@@ -34,6 +34,8 @@ jobs:
         run: cargo test --workspace --locked ${{ matrix.features }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked ${{ matrix.features }} -- -D warnings
+      - name: Peer frame tests (ESP8266 MW v1 vs Rust golden frames)
+        run: scripts/test-peers.sh
 
   # The simulator module and the wasm apps, built for wasm32 on their own
   # (badgectl embeds the module, but this checks the wasm32 build and lints

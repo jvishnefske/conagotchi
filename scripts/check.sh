@@ -37,6 +37,13 @@ for features in "" "--features badge-core/dev"; do
     }
 done
 
+step "peers: ESP8266 MW v1 frame matches the Rust golden frames"
+if command -v "${CXX:-g++}" >/dev/null; then
+    scripts/test-peers.sh
+else
+    echo "skipped: no C++ compiler"
+fi
+
 step "badge-core no_std build (thumbv7em-none-eabihf)"
 cargo +stable build -p badge-core --target thumbv7em-none-eabihf
 cargo +stable build -p badge-core --target thumbv7em-none-eabihf --features dev

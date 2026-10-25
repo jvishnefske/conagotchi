@@ -146,6 +146,14 @@ Flash layout: `firmware/partitions.csv` is the stock table with the unused otada
   - Pending: a stock badge trading while adverts are multiplexed.
 - [x] FR-39 `badgectl sim` runs badge-core compiled to wasm32 for several simulated badges connected by a middleware bus (in process, or Zenoh); two simulated badges complete a Chi trade and converge LED sync, and wasm apps exchange messages, with no hardware. — `fr39_*` (`fr39_two_sim_badges_complete_a_chi_trade`, `fr39_two_sim_badges_converge_led_sync`, `fr39_wasm_app_publish_reaches_the_other_badge`, `fr39_sim_is_deterministic`, bus and Zenoh tests); run 2026-10-24: `badgectl sim --script host/badgectl/scenarios/trade.txt --app apps/hello.wasm`, where both badges reach COMPLETE plus ContactAdded at 3.5 s, share one sync leader with identical LEDs, and receive each other's app messages.
 
+### Cross-chip middleware
+- [x] FR-43 An ESP8266 running `peers/esp8266-espnow` exchanges middleware messages with the badge over ESP-NOW, using middleware's MW v1 frame on channel 1. The ESP8266's Rust HAL has no Wi-Fi driver, so its side is an Arduino C++ port of `espnow::Frame` (`mw_frame.h`: short id, key rules, per-sender dedup), byte-identical to the Rust frames. — `scripts/test-peers.sh` (golden frames from middleware 6b1720e, malformed frames, key and size limits, dedup).
+  - hw 2026-10-25, ESP8266EX `5c:cf:7f:72:f6:54` and the badge, in a 3-minute soak:
+    - the ESP8266 decoded 1201 frames from the badge (LED-sync beacons on `conagotchi/sync` and the wasm payload's `app/hello` counter) with 0 bad, 0 duplicate and 0 dropped frames;
+    - it published `app/hello` every 2 s (500 sends, 0 failures);
+    - the badge's payload logged `rx 8266156`..`rx 8266264` (106 of 109 counter values, about 3% lost on air).
+  - Observed once and not reproduced: before a reflash the badge's RTT control block was found overwritten, and RTT was lost while the firmware kept running. Stack painting in three later runs (payload restart, first `on_message`, 3-minute soak) stayed under 24.6 KB with the block intact.
+
 ## Middleware validation findings (2026-10-24; gaps 1–9 fixed upstream in middleware 0.2, see its CHANGELOG)
 
 Rebuilding badge features on `jvishnefske/middleware` (rev `cd70573`) worked. The ESP-NOW backend, the advertising and GATT bindings and the simulator bus all implement the shared traits, and the same pure `Handler` serves GATT RPC. The gaps below are where the badge had to work around the crate, ordered by how often they came up. Each is a candidate change upstream.
