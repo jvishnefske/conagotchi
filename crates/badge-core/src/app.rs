@@ -66,6 +66,7 @@ use crate::pet::Pet;
 use crate::sync::SyncClock;
 
 mod trade;
+mod wasm;
 
 pub use trade::{CONTACT_ROWS, LobbyRow, TRADE_TICK_EFFECTS, TradeModel};
 
@@ -379,6 +380,13 @@ impl App {
                 self.count_rx(true)
             }
             Input::Gpio { seq, pin, result } => self.gpio_done(seq, pin, result, &mut out),
+            Input::Adc { seq, result } => {
+                match result {
+                    Ok(level) => out.respond(seq, Body::Adc(level)),
+                    Err(code) => out.error(seq, code, "adc"),
+                }
+                self
+            }
             Input::WifiScanned { seq, result } => self.wifi_scanned(seq, result, &mut out),
             Input::Wifi { seq, result } => self.wifi_state(seq, result, &mut out),
             Input::BleScanned { seq, result } => self.ble_scanned(seq, result, &mut out),
@@ -402,6 +410,14 @@ impl App {
                 next
             }
             Input::Storage(StorageEvent::Loaded { key }) => self.storage_loaded(key, &mut out),
+            Input::Wasm { seq, result } => {
+                Self::wasm_done(seq, result, &mut out);
+                self
+            }
+            Input::WasmLog(text) => {
+                Self::wasm_log(text, &mut out);
+                self
+            }
         };
         let next = next
             .refresh_leds(&mut out)
@@ -858,6 +874,24 @@ impl App {
                     out.error(seq, ErrorCode::PinNotAllowed, "not a probe pin");
                 }
             }
+            #[cfg(feature = "dev")]
+            Cmd::AdcRead(a) => {
+                if !board::adc_allowed(a.pin) {
+                    out.error(seq, ErrorCode::PinNotAllowed, "ADC1 pins: 1 3 5 6 7 8");
+                } else if a.samples > crate::io::MAX_ADC_SAMPLES {
+                    out.error(seq, ErrorCode::BadArgument, "samples > 64");
+                } else {
+                    let samples = match a.samples {
+                        0 => crate::io::DEFAULT_ADC_SAMPLES,
+                        n => n,
+                    };
+                    out.push(Effect::AdcRead { seq, pin: a.pin, samples });
+                }
+            }
+            #[cfg(not(feature = "dev"))]
+            Cmd::AdcRead(_) => {
+                out.error(seq, ErrorCode::Unsupported, "adc needs dev build");
+            }
             #[cfg(not(feature = "dev"))]
             Cmd::GpioRead(_) | Cmd::GpioWrite(_) => {
                 out.error(seq, ErrorCode::Unsupported, "gpio needs dev build");
@@ -940,6 +974,9 @@ impl App {
             | Cmd::ListContacts(_)
             | Cmd::ClearContacts(_)
             | Cmd::GetLobby(_)) => self = self.trade_host(seq, cmd, out),
+            cmd @ (Cmd::WasmLoad(_) | Cmd::WasmStart(_) | Cmd::WasmStop(_) | Cmd::GetWasm(_)) => {
+                Self::wasm_host(seq, cmd, out);
+            }
         }
         self
     }

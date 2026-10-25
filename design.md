@@ -121,6 +121,43 @@ Flash layout: `firmware/partitions.csv` is the stock table with the unused otada
 - [ ] FR-35 A tagged release produces `conagotchi-merged.bin` (no key, not past 0x200000) that the three-command Nix quick start flashes over USB. — hw 2026-10-24: a locally built merged image (0xE9480 bytes) written with Nix-provided espflash at 0x0 booted without a replug and kept the key. Pending: a real tagged release.
 
 
+### Battery sensing (investigation)
+- [ ] FR-40 In a `dev` build, `AdcRead` (`badgectl adc read <pin>` / `adc scan`) samples the ADC1-capable probe pins (GPIO 1, 3, 5, 6, 7, 8) with eFuse-calibrated ADC1 at 11 dB and reports mean, min and max in mV; other pins return `PIN_NOT_ALLOWED`, and default builds return `UNSUPPORTED`. ADC2 pins are excluded because ADC2 is shared with Wi-Fi. The stock firmware never reads a battery voltage, and the PCB shows no obvious divider, so this probe is how to find out. — `fr40_*`. Pending: a scan on hardware.
+
+### Middleware and wasm (this repo validates `jvishnefske/middleware`)
+- [ ] FR-36 A wasm app (ABI in `crates/wasm-abi`) can be uploaded over RTT (`WasmLoad` chunks, at most 16 KiB), started, stopped and queried; each `init`/`tick` call is fuel-bounded, traps stop the app with an error in `WasmStatus`, and app log lines arrive as `WasmLog` events. The same `wasm-runtime` crate (wasmi 2.0, 1-byte pages, at most 16 KiB of linear memory, 4 KiB of code, 4 KiB of data) runs apps on the badge and in the simulator. — `fr36_*` (`wasm-runtime/tests`, running the real `apps/hello.wasm`; heap stays within the 64 KiB budget), `app::wasm::tests::fr36_*`; simulator: the demo app logs, shows text and publishes. Pending: upload and run on the badge, and measure heap and tick time.
+- [ ] FR-37 An ESP-NOW backend implements the middleware `Publisher`/`Subscriber` traits; LED sync beacons travel as samples on key `conagotchi/sync`, and wasm apps' `app/...` keys travel between badges. — `fr37_*` (in-memory radio: framing, per-sender dedupe, prefix subscriptions, own-frame filter). Pending: two badges on hardware. New firmware does not sync with older builds, which used bare `OZL1` frames.
+- [ ] FR-38 The middleware BLE backends run on the badge radio: middleware advertising pub/sub time-shares the single advertising set with the stock OZ beacon (which stays visible often enough for stock trades), and a middleware GATT `Responder` answers `conagotchi/info`, `conagotchi/pet` and `conagotchi/pattern`. — `fr38_*` (multiplexer duty and gap under load, publisher → multiplexer → subscriber round trip, RPC end to end with the middleware's own `Requester`). Pending: bluetoothctl RPC and stock trades on hardware.
+- [x] FR-39 `badgectl sim` runs badge-core compiled to wasm32 for several simulated badges connected by a middleware bus (in process, or Zenoh); two simulated badges complete a Chi trade and converge LED sync, and wasm apps exchange messages, with no hardware. — `fr39_*` (`fr39_two_sim_badges_complete_a_chi_trade`, `fr39_two_sim_badges_converge_led_sync`, `fr39_wasm_app_publish_reaches_the_other_badge`, `fr39_sim_is_deterministic`, bus and Zenoh tests); run 2026-10-24: `badgectl sim --script host/badgectl/scenarios/trade.txt --app apps/hello.wasm`, where both badges reach COMPLETE plus ContactAdded at 3.5 s, share one sync leader with identical LEDs, and receive each other's app messages.
+
+## Middleware validation findings (2026-10-24)
+
+Rebuilding badge features on `jvishnefske/middleware` (rev `cd70573`) worked. The ESP-NOW backend, the advertising and GATT bindings and the simulator bus all implement the shared traits, and the same pure `Handler` serves GATT RPC. The gaps below are where the badge had to work around the crate, ordered by how often they came up. Each is a candidate change upstream.
+
+1. **No dynamic or prefix subscriptions.** `Subscriber` backends take a fixed key list fixed at construction, and keys exclude wildcards, but wasm apps subscribe at runtime. ESP-NOW added `with_prefixes(["app/"])`, BLE added a learned key table, and the simulator re-subscribes from `Runtime::subscriptions()`. Suggestion: a `KeyFilter` (exact or prefix) and a trait for adding subscriptions, since Zenoh's `subscriber` is inherent today.
+2. **`Sample` has no sender or sequence number, and there is no "not to self" option.** Every backend needed it: ESP-NOW added `recv_from`, BLE dedupes per address, and the Zenoh bridge wraps payloads in an 8-byte origin envelope.
+3. **`DedupTable` keeps one entry per key, not per sender.** Every node's sequence starts at 0, so two senders on one key suppress each other on a broadcast medium. `Sequence` cannot be constructed outside the crate, and no wide hash is exported (`short_id` is 16-bit, `fnv1a64` is private).
+4. **Cancel safety and non-blocking receive are unspecified.**
+   - `Subscriber::recv` only awaits, so tick-driven code polls once with a no-op waker.
+   - `Responder::serve_one` holds reassembly state across awaits, so cancelling it in a `select` loses a partial request and poisons the next one.
+   - `Scanner::next_report` cannot be fed from a synchronous radio callback without a queue.
+   - Suggestion: `try_recv` and documented cancel-safety.
+5. **`Advertiser` assumes it owns the advertising set.** The badge's single set is shared with the stock trade beacon, so "replace the data" became "enqueue for a 300 ms slot", and `publish` returns before anything is on air.
+6. **Adverts carry only a 16-bit short id, not the key.** Receivers must know key text in advance, prefixes are impossible and collisions go unnoticed. With Flags only 21 payload bytes remain, the service UUID and a payload don't fit together (so publishers are invisible to `discover`), and there is no scan-response or extended-advertising support.
+7. **`GattLink` mixes client and server roles and has no connection lifecycle.**
+   - A server-only binding must fail `write`.
+   - The MTU is per connection but `att_mtu` is fixed per link.
+   - There are no connect or disconnect events.
+   - Notifies sent before the central subscribes are silently dropped.
+   - The 514-byte rx/tx buffers are fixed, not generic over N or the MTU, costing about 1 KB per call.
+8. **One `&mut self` serves both publish and recv.** A transport owning both radio halves cannot publish while a receive is pending.
+9. **The traits don't expose size limits** (max key or payload per backend), and buffer-too-small semantics differ between backends: Zenoh drops the sample, the in-process bus keeps it.
+10. **Smaller points.**
+    - `with_services` duplicates the handler's own `NotFound` dispatch, and there is no `Busy` handler error.
+    - There is no owned key type.
+    - The Zenoh backend needs a Tokio runtime even inside one process.
+    - A connect to an endpoint with no listener appeared to succeed without error (seen once, not yet reproduced).
+
 ## Spike: cloning from one badge to another without a PC (findings, 2026-10-23)
 
 Read-only research. No shipping code came out of it.

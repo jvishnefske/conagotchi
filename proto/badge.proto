@@ -75,6 +75,15 @@ enum TradeState {
   TRADE_STATE_CANCELLED = 5;   // TradeCancel or START on the badge
 }
 
+// Lifecycle of the on-badge wasm app.
+enum WasmState {
+  WASM_STATE_EMPTY = 0;    // no module loaded
+  WASM_STATE_LOADING = 1;  // WasmLoad chunks arriving
+  WASM_STATE_LOADED = 2;   // complete module, validated, not running
+  WASM_STATE_RUNNING = 3;  // init() ran; tick() is called every core tick
+  WASM_STATE_TRAPPED = 4;  // trapped or ran out of fuel; see WasmStatus.error
+}
+
 // How a lobby peer was heard.
 enum Via {
   VIA_UNSPECIFIED = 0;
@@ -204,6 +213,31 @@ message GetSync {}
 // Lists badges currently heard in the trade lobby.
 message GetLobby {}
 
+// One chunk of a wasm module upload. offset 0 starts a new upload (stopping
+// any running app); chunks must arrive in order; the upload is complete when
+// offset + len(data) == total.
+message WasmLoad {
+  uint32 offset = 1;
+  bytes data = 2;   // up to 192 bytes
+  uint32 total = 3; // full module size, at most wasm_abi::MAX_MODULE
+}
+
+// Instantiates the loaded module, runs its `init` export, then calls `tick`
+// every core tick.
+message WasmStart {}
+
+// Stops the app; the module stays loaded.
+message WasmStop {}
+
+message GetWasm {}
+
+// Samples a probe pin with ADC1 (dev builds only). Only the ADC1-capable
+// probe pins are accepted (ADC2 is shared with Wi-Fi on the ESP32-S3).
+message AdcRead {
+  uint32 pin = 1;
+  uint32 samples = 2;  // 0 = default (16), at most 64
+}
+
 message HostMsg {
   uint32 seq = 1;
   oneof cmd {
@@ -234,6 +268,11 @@ message HostMsg {
     GetBleMetrics get_ble_metrics = 26;
     GetSync get_sync = 27;
     GetLobby get_lobby = 28;
+    WasmLoad wasm_load = 29;
+    WasmStart wasm_start = 30;
+    WasmStop wasm_stop = 31;
+    GetWasm get_wasm = 32;
+    AdcRead adc_read = 33;
   }
 }
 
@@ -355,6 +394,23 @@ message Lobby {
   string peer = 5;               // current trade peer, empty if idle
 }
 
+message WasmStatus {
+  WasmState state = 1;
+  uint32 size = 2;       // bytes received / module size
+  uint64 fuel_used = 3;  // total fuel consumed since start
+  uint32 ticks = 4;      // tick() calls since start
+  string error = 5;      // trap or validation message, empty if none
+}
+
+// Calibrated ADC1 reading at 11 dB attenuation (about 0..3100 mV).
+message AdcLevel {
+  uint32 pin = 1;
+  uint32 millivolts = 2;  // mean of the samples
+  uint32 min_mv = 3;
+  uint32 max_mv = 4;
+  uint32 samples = 5;
+}
+
 message Response {
   uint32 seq = 1;  // echoes HostMsg.seq
   oneof body {
@@ -371,6 +427,8 @@ message Response {
     BleMetrics ble_metrics = 12;
     SyncState sync = 13;
     Lobby lobby = 14;
+    WasmStatus wasm = 15;
+    AdcLevel adc = 16;
   }
 }
 
@@ -403,6 +461,11 @@ message ContactAdded {
   Contact contact = 1;
 }
 
+// A line logged by the wasm app (`badge::log`).
+message WasmLog {
+  string text = 1;
+}
+
 message Event {
   oneof kind {
     ButtonEvent button = 1;
@@ -410,6 +473,7 @@ message Event {
     PetChanged pet = 3;
     TradeEvent trade = 4;
     ContactAdded contact_added = 5;
+    WasmLog wasm_log = 6;
   }
 }
 

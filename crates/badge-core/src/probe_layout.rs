@@ -95,6 +95,10 @@ pub const MAILBOX_SEQ: u32 = 0xFFFF_FFFF;
 /// Their responses go to RTT like any other.
 pub const GATT_SEQ: u32 = 0xFFFF_FFFE;
 
+/// Sequence number used for host messages synthesised from wasm app calls
+/// (`set_leds`, `show_text`, `set_pet`). Their responses go to RTT too.
+pub const WASM_SEQ: u32 = 0xFFFF_FFFD;
+
 /// Converts a mailbox command into the equivalent host message.
 ///
 /// Returns `None` for an empty (0) or unknown command, which the firmware

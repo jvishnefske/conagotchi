@@ -104,6 +104,16 @@ pub fn probe_allowed(pin: u32) -> bool {
     PROBE_PINS.iter().any(|g| u32::from(g.0) == pin)
 }
 
+/// Probe pins that can be sampled with ADC1 (`AdcRead`, dev builds). ADC1 is
+/// GPIO1..=10 on the S3; ADC2 (GPIO11..=20) is shared with Wi-Fi, so probe
+/// pins 15..=18 are left out.
+pub const ADC_PINS: &[Gpio] = &[Gpio(1), Gpio(3), Gpio(5), Gpio(6), Gpio(7), Gpio(8)];
+
+/// True if `pin` may be sampled with `AdcRead`.
+pub fn adc_allowed(pin: u32) -> bool {
+    ADC_PINS.iter().any(|g| u32::from(g.0) == pin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +136,11 @@ mod tests {
 
     #[test]
     fn probe_pins_avoid_board_and_reserved_pins() {
+        for p in ADC_PINS {
+            assert!(PROBE_PINS.contains(p), "ADC pin {} is not a probe pin", p.0);
+            assert!((1..=10).contains(&p.0), "GPIO{} is not on ADC1", p.0);
+        }
+        assert!(adc_allowed(1) && !adc_allowed(15) && !adc_allowed(2));
         for p in PROBE_PINS {
             assert!(!USED.contains(p), "probe pin {} drives board hardware", p.0);
             assert!(!RESERVED.contains(p), "probe pin {} is reserved", p.0);

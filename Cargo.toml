@@ -3,7 +3,15 @@
 # because it needs the Xtensa toolchain and build-std.
 [workspace]
 resolver = "3"
-members = ["crates/badge-proto", "crates/badge-core", "host/badgectl"]
+members = [
+    "crates/badge-proto",
+    "crates/badge-core",
+    "crates/badge-mw",
+    "crates/wasm-abi",
+    "crates/wasm-runtime",
+    "crates/badge-sim",
+    "host/badgectl",
+]
 exclude = ["firmware"]
 
 [workspace.package]
@@ -17,3 +25,21 @@ badge-proto = { path = "crates/badge-proto" }
 badge-core = { path = "crates/badge-core" }
 micropb = { version = "0.6.0", default-features = false, features = ["encode", "decode", "enable-64bit", "container-heapless-0-9"] }
 heapless = "0.9.3"
+badge-mw = { path = "crates/badge-mw" }
+wasm-abi = { path = "crates/wasm-abi" }
+wasm-runtime = { path = "crates/wasm-runtime" }
+# Transport-agnostic pub/sub + request/response; this repo validates it.
+middleware = { git = "https://github.com/jvishnefske/middleware", rev = "cd70573eca16186cb30352c3983ed862d2bdf477", default-features = false }
+
+# `badgectl sim` interprets the badge core with wasmi; unoptimised, the
+# interpreter is ~100x slower and the simulator tests take minutes.
+[profile.dev.package.wasmi]
+opt-level = 3
+[profile.dev.package.wasmi_core]
+opt-level = 3
+[profile.dev.package.wasmi_ir]
+opt-level = 3
+[profile.dev.package.wasmi_collections]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3

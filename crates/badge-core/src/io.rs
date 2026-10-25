@@ -80,6 +80,13 @@ pub enum Input {
         /// Level read back, or the failure.
         result: Result<bool, ErrorCode>,
     },
+    /// Result of an [`Effect::AdcRead`].
+    Adc {
+        /// Sequence number of the originating request.
+        seq: u32,
+        /// The reading, or the failure.
+        result: Result<badge_proto::AdcLevel, ErrorCode>,
+    },
     /// Result of an [`Effect::WifiScan`].
     WifiScanned {
         /// Sequence number of the originating request; `None` if started from the badge UI.
@@ -133,6 +140,50 @@ pub enum Input {
     },
     /// Flash storage report.
     Storage(StorageEvent),
+    /// Answer to an [`Effect::Wasm`] command from the wasm runtime.
+    Wasm {
+        /// Sequence number of the originating request.
+        seq: u32,
+        /// Runtime status after the command, or the failure.
+        result: Result<badge_proto::WasmStatus, ErrorCode>,
+    },
+    /// A line the wasm app logged (`badge::log`); sent to the host as a
+    /// `WasmLog` event.
+    WasmLog(String<{ WASM_LOG_LEN }>),
+}
+
+/// Samples taken when `AdcRead.samples` is 0.
+pub const DEFAULT_ADC_SAMPLES: u32 = 16;
+/// Most samples one `AdcRead` may take.
+pub const MAX_ADC_SAMPLES: u32 = 64;
+
+/// Longest wasm log line carried through the core.
+pub const WASM_LOG_LEN: usize = 64;
+/// Largest wasm upload chunk (matches `WasmLoad.data`).
+pub const WASM_CHUNK: usize = 192;
+
+/// A wasm runtime command, executed by the firmware's wasm task (or the
+/// simulator) and answered with [`Input::Wasm`].
+// `Load` carries the chunk inline (no heap to box into); commands travel in
+// fixed-capacity effect vectors, so the size is bounded and known.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum WasmCmd {
+    /// Store one upload chunk; `offset` 0 starts a new upload.
+    Load {
+        /// Byte offset of `data` in the module.
+        offset: u32,
+        /// Full module size.
+        total: u32,
+        /// The chunk.
+        data: Vec<u8, WASM_CHUNK>,
+    },
+    /// Instantiate the loaded module and run `init`.
+    Start,
+    /// Stop the running app (module stays loaded).
+    Stop,
+    /// Report status only.
+    Status,
 }
 
 /// A primitive the shell draws directly when the host paints the screen.
@@ -181,6 +232,15 @@ pub enum Effect {
         seq: u32,
         /// Pin, already checked against `board::PROBE_PINS`.
         pin: u32,
+    },
+    /// Sample a pin with ADC1; answer with [`Input::Adc`].
+    AdcRead {
+        /// Request sequence number.
+        seq: u32,
+        /// Pin, already checked against `board::ADC_PINS`.
+        pin: u32,
+        /// Number of samples, 1..=[`MAX_ADC_SAMPLES`].
+        samples: u32,
     },
     /// Drive a probe pin; answer with [`Input::Gpio`].
     GpioWrite {
@@ -241,6 +301,13 @@ pub enum Effect {
     SaveContact(Contact),
     /// Erase all stored contacts.
     ClearContacts,
+    /// Run a wasm runtime command; answer with [`Input::Wasm`].
+    Wasm {
+        /// Request sequence number.
+        seq: u32,
+        /// What to do.
+        cmd: WasmCmd,
+    },
 }
 
 /// Effects produced by one `App::handle` call, in execution order.

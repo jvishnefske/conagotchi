@@ -1596,3 +1596,45 @@ fn chord_of_five_counts_every_press() {
     assert_eq!(presses, 5);
     assert_eq!(app.press_counts(), [0, 1, 1, 1, 1, 1]);
 }
+
+// ------------------------------------------------------------------- adc
+
+#[cfg(feature = "dev")]
+#[test]
+fn fr40_adc_read_on_adc1_probe_pins_only() {
+    use badge_proto::AdcRead;
+    let (_, fx) = host(booted(), 1, Cmd::AdcRead(AdcRead { pin: 3, samples: 0 }));
+    assert_eq!(fx.as_slice(), &[Effect::AdcRead { seq: 1, pin: 3, samples: 16 }]);
+    let (_, fx) = host(booted(), 2, Cmd::AdcRead(AdcRead { pin: 8, samples: 64 }));
+    assert_eq!(fx.as_slice(), &[Effect::AdcRead { seq: 2, pin: 8, samples: 64 }]);
+    // ADC2 probe pin, non-probe pin, too many samples.
+    for (pin, samples, code) in [
+        (15, 0, ErrorCode::PinNotAllowed),
+        (2, 0, ErrorCode::PinNotAllowed),
+        (1, 65, ErrorCode::BadArgument),
+    ] {
+        let (_, fx) = host(booted(), 3, Cmd::AdcRead(AdcRead { pin, samples }));
+        assert_eq!(fx.len(), 1);
+        assert_eq!(error_code(&only_response(&fx, 3)), code);
+    }
+}
+
+#[cfg(feature = "dev")]
+#[test]
+fn fr40_adc_result_is_the_one_response() {
+    use badge_proto::AdcLevel;
+    let level = AdcLevel { pin: 1, millivolts: 1850, min_mv: 1840, max_mv: 1861, samples: 16 };
+    let (_, fx) = booted().handle(Input::Adc { seq: 4, result: Ok(level) });
+    assert_eq!(only_response(&fx, 4), Body::Adc(level));
+    let (_, fx) = booted().handle(Input::Adc { seq: 5, result: Err(ErrorCode::Radio) });
+    assert_eq!(error_code(&only_response(&fx, 5)), ErrorCode::Radio);
+}
+
+#[cfg(not(feature = "dev"))]
+#[test]
+fn fr40_adc_is_unsupported_without_dev_feature() {
+    use badge_proto::AdcRead;
+    let (_, fx) = host(booted(), 1, Cmd::AdcRead(AdcRead { pin: 1, samples: 0 }));
+    assert_eq!(fx.len(), 1);
+    assert_eq!(error_code(&only_response(&fx, 1)), ErrorCode::Unsupported);
+}
