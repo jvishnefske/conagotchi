@@ -1,0 +1,30 @@
+# Demo wasm app for the Conagotchi badge (and `badgectl sim`).
+#
+# Not a member of the host workspace: it only builds for
+# wasm32-unknown-unknown with the linker flags in `.cargo/config.toml`.
+# `scripts/build-apps.sh` builds it and copies the result to
+# `apps/hello.wasm` (the artifact the runtime tests load).
+[workspace]
+
+[package]
+name = "hello"
+edition = "2024"
+version = "0.1.0"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Conagotchi demo wasm app: LED dot, counter on app/hello, logs"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+wasm-abi = { path = "../../crates/wasm-abi", features = ["guest"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

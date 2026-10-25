@@ -5,7 +5,8 @@
 //!
 //! 1. RTT channels and the defmt logger ([`rtt::init`]);
 //! 2. clocks at maximum, the esp-alloc heap (reclaimed bootloader RAM plus
-//!    64 KiB) — this heap exists only for esp-radio, application code never
+//!    64 KiB for esp-radio, plus [`wasm::HEAP_BYTES`] for the wasm runtime;
+//!    one shared allocator) — apart from esp-radio only the wasm runtime
 //!    allocates;
 //! 3. the esp-rtos scheduler on TIMG0 / `FROM_CPU_INTR0`;
 //! 4. drivers: buttons, indicators, WS2812 chain, GC9A01 display and, in
@@ -13,13 +14,14 @@
 //!    driver is left out);
 //! 5. the radio task ([`radio::start`]), the flash storage task
 //!    ([`storage::start`]: stored contacts and radio key, first-boot import of
-//!    the stock key) and the link UART tasks ([`link_uart::start`]);
+//!    the stock key), the wasm app task ([`wasm::start`], no app loaded) and
+//!    the link UART tasks ([`link_uart::start`]);
 //! 6. the core loop, with [`BoardInfo`] built from the eFuse base MAC and the
 //!    crate name and version.
 //!
 //! Modules: [`rtt`] (transport), [`buttons`], [`leds`], [`display`],
 //! `gpio_probe` (`dev` feature only), [`probe`] (debugger status block),
-//! [`radio`], [`storage`], [`link_uart`], [`shell`].
+//! [`radio`], [`storage`], [`wasm`], [`link_uart`], [`shell`].
 //!
 //! Without the `dev` feature the GPIO probe module is compiled out and its 17
 //! pins are never claimed, so they stay unconfigured (reset state).
@@ -39,11 +41,13 @@ mod display;
 mod gpio_probe;
 mod leds;
 mod link_uart;
+mod mw;
 mod probe;
 mod radio;
 mod rtt;
 mod shell;
 mod storage;
+mod wasm;
 
 use badge_core::app::BoardInfo;
 use defmt::{info, warn};
@@ -56,7 +60,7 @@ use static_cell::{ConstStaticCell, StaticCell};
 use crate::buttons::Buttons;
 use crate::display::{Display, DisplayPins};
 #[cfg(feature = "dev")]
-use crate::gpio_probe::{GpioProbe, ProbePin};
+use crate::gpio_probe::{AdcPins, GpioProbe, ProbePin};
 use crate::leds::{Indicators, Ws2812};
 use crate::rtt::HostLink;
 use crate::shell::Hardware;
@@ -82,6 +86,8 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
     // Wi-Fi/BLE coexistence needs more RAM than the reclaimed region alone.
     esp_alloc::heap_allocator!(size: 64 * 1024);
+    // Room for the wasm runtime (wasmi), see `wasm` (shared allocator).
+    esp_alloc::heap_allocator!(size: wasm::HEAP_BYTES);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
@@ -134,13 +140,17 @@ async fn main(spawner: Spawner) -> ! {
     // GPIO probe pins are claimed only in dev builds.
     #[cfg(feature = "dev")]
     let gpio = {
+        // ADC1-capable pins are held raw (digital or ADC driver per request).
+        let adc_pins = AdcPins {
+            gpio1: peripherals.GPIO1,
+            gpio3: peripherals.GPIO3,
+            gpio5: peripherals.GPIO5,
+            gpio6: peripherals.GPIO6,
+            gpio7: peripherals.GPIO7,
+            gpio8: peripherals.GPIO8,
+            adc1: peripherals.ADC1,
+        };
         let probe_pins = [
-            ProbePin::new(peripherals.GPIO1),
-            ProbePin::new(peripherals.GPIO3),
-            ProbePin::new(peripherals.GPIO5),
-            ProbePin::new(peripherals.GPIO6),
-            ProbePin::new(peripherals.GPIO7),
-            ProbePin::new(peripherals.GPIO8),
             ProbePin::new(peripherals.GPIO15),
             ProbePin::new(peripherals.GPIO16),
             ProbePin::new(peripherals.GPIO17),
@@ -153,7 +163,7 @@ async fn main(spawner: Spawner) -> ! {
             ProbePin::new(peripherals.GPIO44),
             ProbePin::new(peripherals.GPIO48),
         ];
-        match GpioProbe::new(probe_pins) {
+        match GpioProbe::new(probe_pins, adc_pins) {
             Ok(g) => {
                 info!("GPIO probe ready ({} pins)", gpio_probe::COUNT);
                 Some(g)
@@ -173,6 +183,11 @@ async fn main(spawner: Spawner) -> ! {
     match storage::start(&spawner, peripherals.FLASH) {
         Ok(()) => info!("storage task started"),
         Err(e) => warn!("storage start failed: {}", e),
+    }
+
+    match wasm::start(&spawner) {
+        Ok(()) => info!("wasm task started"),
+        Err(e) => warn!("wasm start failed: {}", e),
     }
 
     match link_uart::start(&spawner, peripherals.UART1, peripherals.GPIO39, peripherals.GPIO40) {

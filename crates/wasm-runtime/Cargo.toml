@@ -1,0 +1,24 @@
+[package]
+name = "wasm-runtime"
+description = "Bounded wasm app runtime (wasmi) shared by the badge firmware and the host simulator"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+wasm-abi.workspace = true
+badge-proto.workspace = true
+heapless.workspace = true
+# Interpreter. no_std: `validate` gives the safe `Module::new`;
+# `prefer-btree-collections` avoids hash maps (no RNG/hasher on the badge);
+# `portable-dispatch` is the loop-based dispatcher: the default tail-call
+# dispatcher relies on sibling-call optimisation, without which (debug builds,
+# targets LLVM cannot tail-call on) every executed instruction nests a stack
+# frame and overflows the stack. No `std`, `wat`, `memory64`, `simd`, `libm`.
+wasmi = { version = "2.0.0", default-features = false, features = ["validate", "prefer-btree-collections", "portable-dispatch", "indirect-dispatch"] }
+
+[dev-dependencies]
+wat = "1.262.0"
+# Peak-heap measurement in tests/fr36_heap.rs (safe global allocator wrapper).
+peak_alloc = "0.3.0"

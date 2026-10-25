@@ -26,6 +26,10 @@ dev = ["badge-core/dev"]
 [dependencies]
 badge-core  = { path = "../crates/badge-core" }
 badge-proto = { path = "../crates/badge-proto" }
+badge-mw    = { path = "../crates/badge-mw" }
+wasm-abi    = { path = "../crates/wasm-abi" }
+# Wasm app runtime (wasmi; allocates from the esp-alloc heap, see src/wasm.rs).
+wasm-runtime = { path = "../crates/wasm-runtime" }
 
 esp-hal = { version = "~1.2.2", features = ["defmt", "esp32s3", "unstable"] }
 
@@ -106,3 +110,11 @@ codegen-units = 1
 debug         = 2
 lto           = 'fat'
 opt-level     = 's'
+
+# The wasm interpreter is most of the flash image; build it for size.
+[profile.release.package.wasmi]
+opt-level = "z"
+[profile.release.package.wasmi_ir]
+opt-level = "z"
+[profile.release.package.wasmparser]
+opt-level = "z"

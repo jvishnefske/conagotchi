@@ -7,6 +7,8 @@
 //!    (`Input::Host` / `Input::HostGarbage`);
 //! 3. drains up to [`MAX_RADIO_PER_TICK`] results from
 //!    [`RADIO_EVENTS`];
+//!    then up to [`MAX_WASM_PER_TICK`] inputs from the wasm task
+//!    ([`wasm::try_next`]: command answers, app logs, app host messages);
 //! 4. takes a pending `PROBE` mailbox command as `Input::Host`;
 //! 5. feeds follow-up inputs produced while executing effects (GPIO results,
 //!    `BUSY` answers when the radio queue is full), bounded per tick;
@@ -21,7 +23,8 @@
 //! `Indicator` → GPIO, `Draw` → panel, `GpioRead`/`GpioWrite` → probe pins
 //! with the result fed back, radio effects → [`RADIO_CMDS`], `LinkSend` →
 //! [`link_uart::send`], `SaveContact`/`ClearContacts` → [`storage::submit`]
-//! (both queue without waiting and drop when full). `Redraw` is
+//! (both queue without waiting and drop when full), `Wasm` →
+//! [`wasm::submit`] (answered `BUSY` when its queue is full). `Redraw` is
 //! coalesced to one render per tick (a full render also covers a pending
 //! `Animate`); a pending render is flushed before any `Draw` so drawing order
 //! is preserved.
@@ -52,6 +55,7 @@ use crate::probe::{self, Mailbox, Snapshot};
 use crate::radio::{RADIO_CMDS, RADIO_EVENTS};
 use crate::rtt::HostLink;
 use crate::storage::{self, StorageCmd};
+use crate::wasm;
 use crate::link_uart;
 
 /// Core loop period.
@@ -60,6 +64,8 @@ pub const TICK_MS: u64 = 20;
 pub const MAX_HOST_PER_TICK: usize = 4;
 /// Radio results handled per tick.
 pub const MAX_RADIO_PER_TICK: usize = 4;
+/// Wasm answers, app logs and app host messages handled per tick.
+pub const MAX_WASM_PER_TICK: usize = 4;
 /// Capacity of the follow-up input queue.
 const FOLLOWUP_CAP: usize = 8;
 /// Follow-up inputs handled per tick.
@@ -138,6 +144,13 @@ pub async fn run(hw: Hardware, info: BoardInfo) -> ! {
             match RADIO_EVENTS.try_receive() {
                 Ok(input) => app = shell.feed(app, input),
                 Err(_) => break,
+            }
+        }
+
+        for _ in 0..MAX_WASM_PER_TICK {
+            match wasm::try_next() {
+                Some(input) => app = shell.feed(app, input),
+                None => break,
             }
         }
 
@@ -222,11 +235,23 @@ impl Shell {
                 };
                 self.follow_up(Input::Gpio { seq, pin, result });
             }
+            #[cfg(feature = "dev")]
+            Effect::AdcRead { seq, pin, samples } => {
+                let result = match self.hw.gpio.as_mut() {
+                    Some(gpio) => gpio.adc_read(pin, samples),
+                    None => Err(ErrorCode::Unsupported),
+                };
+                self.follow_up(Input::Adc { seq, result });
+            }
             // No probe pins without `dev` (the core never asks then anyway).
             #[cfg(not(feature = "dev"))]
             Effect::GpioRead { seq, pin } | Effect::GpioWrite { seq, pin, .. } => {
                 let result = Err(ErrorCode::Unsupported);
                 self.follow_up(Input::Gpio { seq, pin, result });
+            }
+            #[cfg(not(feature = "dev"))]
+            Effect::AdcRead { seq, .. } => {
+                self.follow_up(Input::Adc { seq, result: Err(ErrorCode::Unsupported) });
             }
             radio @ (Effect::WifiScan { .. }
             | Effect::WifiConnect { .. }
@@ -245,6 +270,13 @@ impl Shell {
             Effect::LinkSend(frame) => link_uart::send(frame),
             Effect::SaveContact(contact) => storage::submit(StorageCmd::Save(contact)),
             Effect::ClearContacts => storage::submit(StorageCmd::Clear),
+            // The wasm task answers on its own queue (drained below); a
+            // full command queue is answered BUSY here.
+            Effect::Wasm { seq, cmd } => {
+                if let Some(busy) = wasm::submit(seq, cmd) {
+                    self.follow_up(busy);
+                }
+            }
         }
     }
 
