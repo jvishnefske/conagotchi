@@ -18,12 +18,36 @@
 //! `Peripheral::update_adv_data`, which issues `LE Set Advertising Data` and
 //! `LE Set Scan Response Data` without restarting the set. The update passes
 //! `Advertisement::NonconnectableScannableUndirected` only so trouble skips
-//! its Flags check: the PDU type stays the one set at start. The ADV_IND
-//! carries exactly the latest `Effect::Beacon` data (Flags only before the
-//! first beacon); the scan response carries the Complete Local Name,
-//! `"conagotchi"` from boot. `BleAdvertise` changes the name in place (one
-//! `BleAdvertised` reply each); an empty name stops the set, and a later
-//! non-empty name starts it again.
+//! its Flags check: the PDU type stays the one set at start. What the
+//! ADV_IND carries is decided by the pure `badge_mw::ble::mux::AdvMux`
+//! (FR-38): the latest `Effect::Beacon` data (Flags only before the first
+//! beacon), except for one 300 ms slot per queued middleware advert, after
+//! which the beacon is back for at least 700 ms (beacon >= 70 % of the time,
+//! never absent for more than one slot). The multiplexer is stepped when a
+//! beacon or publish arrives, at its own deadline (a timer in the command
+//! loop) and every housekeeping period; whenever its `on_air` data differs
+//! from what was last installed the set is updated in place. The scan
+//! response carries the Complete Local Name, `"conagotchi"` from boot.
+//! `BleAdvertise` changes the name in place (one `BleAdvertised` reply
+//! each); an empty name stops the set, and a later non-empty name starts it
+//! again.
+//!
+//! # Middleware advertising pub/sub
+//!
+//! App publishes drained from [`mw::BLE_OUT`] go through the middleware's
+//! `AdvertisingPublisher` (kept for the life of the task, so its sequence
+//! number advances) over `badge_mw::ble::advert::MuxAdvertiser`, which only
+//! queues them in the multiplexer: manufacturer data under company id
+//! `badge_mw::ble::MW_COMPANY_ID` (`0xFFFF`), `[short id][seq][payload]`,
+//! payloads up to 21 bytes. A payload too large or a full queue drops the
+//! message (counted). The key is also learned by the app-key table below.
+//!
+//! Scan reports whose manufacturer data has that company id are decoded by
+//! a `badge_mw::ble::appkeys::AppKeyTable`, which maps the short id back to
+//! an `app/...` key text it knows (preloaded `KNOWN_APP_KEYS`, plus every
+//! key the app has published on) and drops repeats per sender. A fresh
+//! sample on a key that passes `app_may_use` goes to [`mw::APP_SAMPLES`]
+//! with `try_send` (dropped and counted when full).
 //!
 //! # Scanning
 //!
@@ -60,6 +84,26 @@
 //! air), and advertising resumes within one [`HOUSEKEEPING`] period after the
 //! disconnect.
 //!
+//! # Middleware GATT RPC
+//!
+//! The GATT server also hosts the middleware service
+//! (`badge_mw::ble::rpc::SERVICE_UUID`, `4d579a3e-1c52-4b0f-0000-000000000000`)
+//! with its RPC characteristic (`4d579a3e-1c52-4b0f-0000-000000000001`,
+//! write, write without response, notify, values up to [`RPC_VALUE`] bytes).
+//! A write is copied, with the connection's ATT MTU, into a task-local
+//! channel; an RPC loop running beside the command loop reads it through
+//! `badge_mw::ble::rpc::RpcIo`, runs the middleware `BleTransport`'s
+//! `serve_one` with `badge_mw::ble::rpc::BadgeHandler` (answers from the
+//! PROBE block at the moment of the request) and queues each response
+//! fragment (at most `min(MTU, RPC_VALUE + 3) - 3` bytes) on a second
+//! channel, which the command loop sends as notifications to the connected
+//! central (only after it enabled them). Sets (`conagotchi/pet`,
+//! `conagotchi/pattern` with a one-byte payload) are drained from the
+//! handler's outbox into [`RADIO_EVENTS`] as `Input::Host` with `GATT_SEQ`,
+//! like the Conagotchi service's writes. A write arriving while the inbound
+//! channel is full is rejected (Insufficient Resources); fragments queued
+//! for notification while no central is connected are discarded.
+//!
 //! If the host runner ever fails, the task keeps answering every BLE command
 //! with `ErrorCode::Radio` so each command still gets exactly one reply.
 
@@ -70,19 +114,24 @@ use badge_core::ble_metrics::BleMetrics;
 use badge_core::gatt::{self, GattError, Writable};
 use badge_core::io::{Input, MAX_ADV_DATA, MAX_BLE, Millis, Via};
 use badge_core::{oz, probe_layout};
+use badge_mw::ble::advert::{MuxAdvertiser, mw_template};
+use badge_mw::ble::appkeys::{AppKeyTable, carries_company};
+use badge_mw::ble::rpc::{self as mw_rpc, BadgeHandler, BadgeSnapshot, RpcIo, SnapshotSource};
+use badge_mw::ble::{AdvertisingPublisher, AttMtu, Key, MW_COMPANY_ID, Publisher, Responder};
+use badge_mw::keys::app_may_use;
 use badge_proto::{BleDevice, ErrorCode};
-use defmt::{info, warn};
+use defmt::{Debug2Format, info, warn};
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex};
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Instant, Ticker, with_timeout};
+use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use esp_radio::ble::controller::BleConnector;
 use heapless::{String, Vec};
 use trouble_host::prelude::*;
 
 use super::RADIO_EVENTS;
 use super::rank::{AdvReport, merge_report, rank_devices};
-use crate::probe;
+use crate::{mw, probe};
 
 /// The HCI controller type the BLE host runs on.
 pub type BleController = ExternalController<BleConnector<'static>, 1>;
@@ -146,15 +195,47 @@ const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2;
 /// Longest GATT write we look at (the longest valid one is 3 bytes).
 const MAX_WRITE: usize = 4;
+/// Largest value of the middleware RPC characteristic (one fragment).
+pub const RPC_VALUE: usize = 64;
+/// RPC fragments buffered from the central to the RPC loop.
+const RPC_RX_DEPTH: usize = 4;
+/// RPC response fragments buffered from the RPC loop to the central.
+const RPC_TX_DEPTH: usize = 2;
+
+const _: () = assert!(badge_mw::ble::APP_KEY_LEN == mw::KEY_LEN);
+const _: () = assert!(badge_mw::ble::MAX_ADVERT_PAYLOAD <= mw::PAYLOAD_LEN);
 
 type Host<'a> = Stack<'a, BleController, DefaultPacketPool>;
 type Adv<'a> = Advertiser<'a, BleController, DefaultPacketPool>;
 type Gatt<'a, 's> = GattConnection<'a, 's, DefaultPacketPool>;
+/// The middleware advertising publisher over the multiplexer.
+type MwPublisher = AdvertisingPublisher<'static, MuxAdvertiser>;
 
-/// The GATT server: GAP plus the "Conagotchi" service.
+/// One RPC characteristic write: the value and the connection's ATT MTU.
+struct RpcFrame {
+    mtu: u16,
+    data: Vec<u8, RPC_VALUE>,
+}
+
+/// Writes from the central to the RPC loop.
+type RpcRx = Channel<NoopRawMutex, RpcFrame, RPC_RX_DEPTH>;
+/// Response fragments from the RPC loop to the central.
+type RpcTx = Channel<NoopRawMutex, Vec<u8, RPC_VALUE>, RPC_TX_DEPTH>;
+
+/// The GATT server: GAP, the "Conagotchi" service and the middleware service.
 #[gatt_server(connections_max = CONNECTIONS_MAX, mutex_type = NoopRawMutex)]
 struct Server {
     badge: BadgeService,
+    mw: MwService,
+}
+
+/// The middleware GATT service: one RPC characteristic carrying request
+/// fragments (writes) and response fragments (notifications).
+#[gatt_service(uuid = mw_rpc::SERVICE_UUID)]
+struct MwService {
+    /// Middleware RPC fragments.
+    #[characteristic(uuid = mw_rpc::RPC_CHARACTERISTIC_UUID, write, write_without_response, notify)]
+    rpc: Vec<u8, RPC_VALUE>,
 }
 
 /// Service "Conagotchi" (UUIDs and formats: `badge_core::gatt`).
@@ -189,6 +270,11 @@ struct Collector {
     /// `RadioPacket`s forwarded / dropped because [`RADIO_EVENTS`] was full.
     forwarded: Cell<u32>,
     dropped: Cell<u32>,
+    /// App keys whose middleware adverts are delivered to the app.
+    app_keys: RefCell<AppKeyTable>,
+    /// App samples delivered to / dropped because [`mw::APP_SAMPLES`] was full.
+    app_rx: Cell<u32>,
+    app_dropped: Cell<u32>,
 }
 
 impl Collector {
@@ -200,7 +286,55 @@ impl Collector {
             scanning: Cell::new(false),
             forwarded: Cell::new(0),
             dropped: Cell::new(0),
+            app_keys: RefCell::new(AppKeyTable::new()),
+            app_rx: Cell::new(0),
+            app_dropped: Cell::new(0),
         }
+    }
+
+    /// Preloads the known app keys (not `const`, so not done in `new`).
+    fn load_known_keys(&self) {
+        if let Ok(mut keys) = self.app_keys.try_borrow_mut() {
+            *keys = AppKeyTable::with_known();
+        }
+    }
+
+    /// Lets adverts on `key` reach the app (a full table keeps its keys).
+    fn learn_key(&self, key: &str) {
+        if let Ok(mut keys) = self.app_keys.try_borrow_mut()
+            && let Ok(next) = keys.clone().learn(key)
+        {
+            *keys = next;
+        }
+    }
+
+    /// Delivers a middleware advert on a known app key to the app.
+    fn app_advert(&self, report: &AdvReport<'_>) {
+        if !carries_company(report.data, MW_COMPANY_ID) {
+            return;
+        }
+        let Ok(mut keys) = self.app_keys.try_borrow_mut() else {
+            return;
+        };
+        let (next, sample) = core::mem::take(&mut *keys).decode(report.addr, report.data);
+        *keys = next;
+        let Some(sample) = sample else { return };
+        let Some(key) = keys.key(sample.slot).filter(|k| app_may_use(k)) else {
+            return;
+        };
+        let (Ok(key), Ok(payload)) = (String::try_from(key), Vec::from_slice(sample.payload))
+        else {
+            return;
+        };
+        let counter = if mw::APP_SAMPLES
+            .try_send(mw::MwMessage { key, payload })
+            .is_ok()
+        {
+            &self.app_rx
+        } else {
+            &self.app_dropped
+        };
+        counter.set(counter.get().wrapping_add(1));
     }
 
     /// Clears the device table and opens a `BleScan`.
@@ -239,7 +373,10 @@ impl Collector {
         {
             merge_report(&mut seen, report);
         }
-        let Some(payload) = payload else { return };
+        let Some(payload) = payload else {
+            self.app_advert(report);
+            return;
+        };
         let admitted = self
             .forward
             .try_borrow_mut()
@@ -298,6 +435,9 @@ pub async fn ble_task(controller: BleController) {
     let stack = trouble_host::new(controller, &mut resources).build();
     let mut runner = stack.runner();
     let collector = Collector::new();
+    collector.load_known_keys();
+    let rpc_rx = RpcRx::new();
+    let rpc_tx = RpcTx::new();
     let server = match Server::new_default(DEFAULT_NAME) {
         Ok(server) => Some(server),
         Err(e) => {
@@ -306,9 +446,10 @@ pub async fn ble_task(controller: BleController) {
         }
     };
 
-    if let Either::First(result) = select(
+    if let Either3::First(result) = select3(
         runner.run_with_handler(&collector),
-        serve(&stack, &collector, server.as_ref()),
+        serve(&stack, &collector, server.as_ref(), &rpc_rx, &rpc_tx),
+        rpc_loop(&rpc_rx, &rpc_tx),
     )
     .await
     {
@@ -343,8 +484,14 @@ fn error_reply(cmd: &BleCmd, code: ErrorCode) -> Option<Input> {
 struct Session<'d, 's> {
     /// Scan-response name; empty = advertising stopped by request.
     name: String<29>,
-    /// Latest `Effect::Beacon` data.
-    beacon: Vec<u8, MAX_ADV_DATA>,
+    /// Middleware publisher; its advertiser owns the advertising multiplexer
+    /// (beacon plus queued middleware adverts).
+    publisher: MwPublisher,
+    /// The advertising data last installed in the running set.
+    installed: Vec<u8, MAX_ADV_DATA>,
+    /// App publishes queued for advertising / dropped.
+    mw_sent: u32,
+    mw_dropped: u32,
     /// Keeps the advertising set alive; dropping it stops advertising.
     adv: Option<Adv<'d>>,
     /// Do not try to (re)start advertising before this time.
@@ -363,8 +510,24 @@ struct Session<'d, 's> {
     next_log: Instant,
 }
 
+/// What woke the command loop.
+enum Wake<'a, 's> {
+    Cmd(BleCmd),
+    Tick,
+    Gatt(GattConnectionEvent<'a, 's, DefaultPacketPool>),
+    Publish(mw::MwMessage),
+    MuxDeadline,
+    RpcOut(Vec<u8, RPC_VALUE>),
+}
+
 /// Command loop: runs while the host runner is alive.
-async fn serve(stack: &Host<'_>, collector: &Collector, server: Option<&Server<'static>>) {
+async fn serve(
+    stack: &Host<'_>,
+    collector: &Collector,
+    server: Option<&Server<'static>>,
+    rpc_rx: &RpcRx,
+    rpc_tx: &RpcTx,
+) {
     let mut scanner = Scanner::new(stack.central());
     let mut peripheral = stack.peripheral();
     let config = ScanConfig {
@@ -392,7 +555,10 @@ async fn serve(stack: &Host<'_>, collector: &Collector, server: Option<&Server<'
     let now = Instant::now();
     let mut s = Session {
         name: ble_adv_name(DEFAULT_NAME),
-        beacon: Vec::new(),
+        publisher: AdvertisingPublisher::new(MuxAdvertiser::new(), mw_template()),
+        installed: Vec::new(),
+        mw_sent: 0,
+        mw_dropped: 0,
         adv: None,
         adv_retry_at: now,
         conn: None,
@@ -412,20 +578,90 @@ async fn serve(stack: &Host<'_>, collector: &Collector, server: Option<&Server<'
                     None => core::future::pending().await,
                 }
             };
-            select3(BLE_CMDS.receive(), ticker.next(), gatt_next).await
+            let deadline = s.publisher.advertiser_mut().mux().next_deadline();
+            let mux_due = async {
+                match deadline {
+                    Some(at) => Timer::at(Instant::from_millis(at.0)).await,
+                    None => core::future::pending().await,
+                }
+            };
+            let first = select3(BLE_CMDS.receive(), ticker.next(), gatt_next);
+            let second = select3(mw::BLE_OUT.receive(), mux_due, rpc_tx.receive());
+            match select(first, second).await {
+                Either::First(Either3::First(cmd)) => Wake::Cmd(cmd),
+                Either::First(Either3::Second(())) => Wake::Tick,
+                Either::First(Either3::Third(ev)) => Wake::Gatt(ev),
+                Either::Second(Either3::First(msg)) => Wake::Publish(msg),
+                Either::Second(Either3::Second(())) => Wake::MuxDeadline,
+                Either::Second(Either3::Third(fragment)) => Wake::RpcOut(fragment),
+            }
         };
         match event {
-            Either3::First(cmd) => command(&mut s, &mut peripheral, collector, scanning, cmd).await,
-            Either3::Second(()) => housekeeping(&mut s, &mut peripheral, collector, server).await,
-            Either3::Third(ev) => {
-                if gatt_event(stack, server, ev).await {
+            Wake::Cmd(cmd) => command(&mut s, &mut peripheral, collector, scanning, cmd).await,
+            Wake::Tick => housekeeping(&mut s, &mut peripheral, collector, server).await,
+            Wake::Gatt(ev) => {
+                let mtu = s.conn.as_ref().map_or(23, |c| c.raw().att_mtu());
+                if gatt_event(stack, server, ev, rpc_rx, mtu).await {
                     info!("ble: central disconnected");
                     s.conn = None;
                 } else {
                     s.last_activity = Instant::now();
                 }
             }
+            Wake::Publish(msg) => {
+                publish_app(&mut s, collector, &msg).await;
+                refresh_adv(&mut s, &mut peripheral).await;
+            }
+            Wake::MuxDeadline => refresh_adv(&mut s, &mut peripheral).await,
+            Wake::RpcOut(fragment) => {
+                if let (Some(conn), Some(server)) = (&s.conn, server) {
+                    let sent =
+                        with_timeout(HCI_TIMEOUT, server.mw.rpc.notify(conn, &fragment, false))
+                            .await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        warn!("ble: rpc notification failed");
+                    }
+                }
+            }
         }
+    }
+}
+
+/// Queues one app publish in the advertising multiplexer through the
+/// middleware publisher, and lets adverts on its key reach the app.
+async fn publish_app(s: &mut Session<'_, '_>, collector: &Collector, msg: &mw::MwMessage) {
+    let key = msg.key.as_str();
+    let queued = match Key::new(key) {
+        Ok(k) if app_may_use(key) => s.publisher.publish(k, &msg.payload).await.is_ok(),
+        _ => false,
+    };
+    if queued {
+        collector.learn_key(key);
+        s.mw_sent = s.mw_sent.wrapping_add(1);
+    } else {
+        s.mw_dropped = s.mw_dropped.wrapping_add(1);
+    }
+}
+
+/// Steps the advertising multiplexer to now and, if advertising, installs
+/// its data when it differs from what is on air.
+async fn refresh_adv(
+    s: &mut Session<'_, '_>,
+    peripheral: &mut Peripheral<'_, BleController, DefaultPacketPool>,
+) {
+    let adv = s.publisher.advertiser_mut();
+    adv.step(Millis(Instant::now().as_millis()));
+    let on_air = adv.mux().on_air();
+    if s.adv.is_none() || on_air == s.installed.as_slice() {
+        return;
+    }
+    let Ok(data) = Vec::from_slice(on_air) else {
+        return;
+    };
+    if update(peripheral, &data, &s.name).await.is_ok() {
+        s.installed = data;
+    } else {
+        warn!("ble: advertising data update failed");
     }
 }
 
@@ -468,20 +704,24 @@ async fn command<'d>(
                 // Resumes with the new name when the central disconnects.
                 Ok(())
             } else if s.adv.is_some() {
-                update(peripheral, &s.beacon, &s.name).await
+                let data = on_air(s);
+                let result = update(peripheral, &data, &s.name).await;
+                if result.is_ok() {
+                    s.installed = data;
+                }
+                result
             } else {
-                let started = start_advertising(peripheral, &s.beacon, &s.name).await;
-                started.map(|handle| s.adv = Some(handle))
+                start(s, peripheral).await
             };
             RADIO_EVENTS
                 .send(Input::BleAdvertised { seq, result })
                 .await;
         }
         BleCmd::Beacon(data) => {
-            s.beacon = data;
-            if s.adv.is_some() && update(peripheral, &s.beacon, &s.name).await.is_err() {
-                warn!("ble: advertising data update failed");
+            if s.publisher.advertiser_mut().set_beacon(&data).is_err() {
+                warn!("ble: beacon longer than advertising data");
             }
+            refresh_adv(s, peripheral).await;
         }
     }
 }
@@ -551,13 +791,42 @@ async fn housekeeping<'d, 's>(
             collector.forwarded.get(),
             collector.dropped.get()
         );
+        info!(
+            "ble: mw adverts queued {} dropped {}, app samples {} dropped {}",
+            s.mw_sent,
+            s.mw_dropped,
+            collector.app_rx.get(),
+            collector.app_dropped.get()
+        );
     }
-    if s.adv.is_none() && s.conn.is_none() && !s.name.is_empty() && now >= s.adv_retry_at {
-        match start_advertising(peripheral, &s.beacon, &s.name).await {
-            Ok(handle) => s.adv = Some(handle),
-            Err(_) => s.adv_retry_at = now + ADV_RETRY,
-        }
+    if s.adv.is_none()
+        && s.conn.is_none()
+        && !s.name.is_empty()
+        && now >= s.adv_retry_at
+        && start(s, peripheral).await.is_err()
+    {
+        s.adv_retry_at = now + ADV_RETRY;
     }
+    refresh_adv(s, peripheral).await;
+}
+
+/// The multiplexer's current advertising data, stepped to now.
+fn on_air(s: &mut Session<'_, '_>) -> Vec<u8, MAX_ADV_DATA> {
+    let adv = s.publisher.advertiser_mut();
+    adv.step(Millis(Instant::now().as_millis()));
+    Vec::from_slice(adv.mux().on_air()).unwrap_or_default()
+}
+
+/// Starts the advertising set with the multiplexer's current data.
+async fn start<'d>(
+    s: &mut Session<'d, '_>,
+    peripheral: &mut Peripheral<'d, BleController, DefaultPacketPool>,
+) -> Result<(), ErrorCode> {
+    let data = on_air(s);
+    let handle = start_advertising(peripheral, &data, &s.name).await?;
+    s.adv = Some(handle);
+    s.installed = data;
+    Ok(())
 }
 
 /// Handles one event of the connected central. Returns true once it has
@@ -566,6 +835,8 @@ async fn gatt_event(
     stack: &Host<'_>,
     server: Option<&Server<'_>>,
     event: GattConnectionEvent<'_, '_, DefaultPacketPool>,
+    rpc_rx: &RpcRx,
+    mtu: u16,
 ) -> bool {
     match event {
         GattConnectionEvent::Disconnected { .. } => return true,
@@ -578,7 +849,7 @@ async fn gatt_event(
             }
         }
         GattConnectionEvent::Gatt { event } => match server {
-            Some(server) => gatt_request(server, event).await,
+            Some(server) => gatt_request(server, event, rpc_rx, mtu).await,
             None => {
                 if let Ok(reply) = event.accept() {
                     reply.send().await;
@@ -590,8 +861,14 @@ async fn gatt_event(
     false
 }
 
-/// Answers one ATT request: refresh read values, map writes to host messages.
-async fn gatt_request(server: &Server<'_>, event: GattEvent<'_, '_, DefaultPacketPool>) {
+/// Answers one ATT request: refresh read values, map writes to host messages,
+/// hand RPC fragments to the RPC loop.
+async fn gatt_request(
+    server: &Server<'_>,
+    event: GattEvent<'_, '_, DefaultPacketPool>,
+    rpc_rx: &RpcRx,
+    mtu: u16,
+) {
     let svc = &server.badge;
     let mut host_msg = None;
     let reply = match event {
@@ -619,6 +896,22 @@ async fn gatt_request(server: &Server<'_>, event: GattEvent<'_, '_, DefaultPacke
                 Ok(())
             };
             read.accept()
+        }
+        GattEvent::Write(write) if write.handle() == server.mw.rpc.handle => {
+            let data = write.with_data(|offset, data| {
+                if offset == 0 {
+                    Vec::from_slice(data).ok()
+                } else {
+                    None
+                }
+            });
+            match data {
+                None => write.reject(AttErrorCode::INVALID_ATTRIBUTE_VALUE_LENGTH),
+                Some(data) => match rpc_rx.try_send(RpcFrame { mtu, data }) {
+                    Ok(()) => write.accept(),
+                    Err(_) => write.reject(AttErrorCode::INSUFFICIENT_RESOURCES),
+                },
+            }
         }
         GattEvent::Write(write) => {
             let handle = write.handle();
@@ -665,6 +958,86 @@ async fn gatt_request(server: &Server<'_>, event: GattEvent<'_, '_, DefaultPacke
     }
 }
 
+/// Badge state for the RPC handler, read from the PROBE block.
+struct ProbeSnapshot;
+
+impl SnapshotSource for ProbeSnapshot {
+    fn snapshot(&self) -> BadgeSnapshot {
+        BadgeSnapshot {
+            firmware: crate::FIRMWARE,
+            mac: base_mac(),
+            chi: probe::word(probe_layout::CHI),
+            pet_selected: probe::word(probe_layout::PET_SELECTED),
+            pattern: probe::word(probe_layout::PATTERN),
+        }
+    }
+}
+
+/// Why the RPC characteristic I/O failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcIoError {
+    /// A value longer than the characteristic or the caller's buffer.
+    TooLong,
+}
+
+/// The RPC characteristic as two task-local channels (see the module docs).
+struct ChannelRpcIo<'a> {
+    rx: &'a RpcRx,
+    tx: &'a RpcTx,
+    /// MTU of the connection the last write came from, capped so a fragment
+    /// fits [`RPC_VALUE`].
+    mtu: AttMtu,
+}
+
+impl RpcIo for ChannelRpcIo<'_> {
+    type Error = RpcIoError;
+
+    fn att_mtu(&self) -> AttMtu {
+        self.mtu
+    }
+
+    async fn notify(&mut self, data: &[u8]) -> Result<(), RpcIoError> {
+        let value = Vec::from_slice(data).map_err(|_| RpcIoError::TooLong)?;
+        self.tx.send(value).await;
+        Ok(())
+    }
+
+    async fn next_write<'b>(&mut self, buf: &'b mut [u8]) -> Result<&'b [u8], RpcIoError> {
+        let frame = self.rx.receive().await;
+        // RPC_VALUE + 3 lies in 23..=517, so the fallback is never used.
+        let capped = frame.mtu.min(RPC_MTU_CAP);
+        self.mtu = AttMtu::new(capped).unwrap_or(AttMtu::DEFAULT);
+        let out = buf.get_mut(..frame.data.len()).ok_or(RpcIoError::TooLong)?;
+        out.copy_from_slice(&frame.data);
+        Ok(out)
+    }
+}
+
+/// Largest ATT MTU the RPC fragments are sized for.
+const RPC_MTU_CAP: u16 = RPC_VALUE as u16 + 3;
+
+/// Serves middleware RPC requests forever (see the module docs).
+async fn rpc_loop(rx: &RpcRx, tx: &RpcTx) {
+    let mut server = mw_rpc::rpc_server(ChannelRpcIo {
+        rx,
+        tx,
+        mtu: AttMtu::DEFAULT,
+    });
+    let mut handler: BadgeHandler<ProbeSnapshot> = BadgeHandler::new(ProbeSnapshot);
+    let mut scratch = [0u8; mw_rpc::RPC_SCRATCH];
+    loop {
+        if let Err(e) = server.serve_one(&mut handler, &mut scratch).await {
+            warn!("ble: rpc request failed: {}", Debug2Format(&e));
+        }
+        for _ in 0..mw_rpc::OUTBOX {
+            let Some(msg) = handler.take_host_msg() else {
+                break;
+            };
+            RADIO_EVENTS.send(Input::Host(msg)).await;
+        }
+    }
+}
+
 /// The eFuse base MAC (the badge id is its last three bytes).
 fn base_mac() -> [u8; 6] {
     let addr = esp_hal::efuse::base_mac_address();
@@ -675,18 +1048,18 @@ fn base_mac() -> [u8; 6] {
     mac
 }
 
-/// Puts `beacon` (or the Flags default) and the `name` scan response on air
+/// Puts advertising data `adv` and the `name` scan response on air
 /// without restarting the advertising set.
 async fn update(
     peripheral: &mut Peripheral<'_, BleController, DefaultPacketPool>,
-    beacon: &[u8],
+    adv: &[u8],
     name: &str,
 ) -> Result<(), ErrorCode> {
     let (scan_data, len) = ble_adv::scan_response(name);
     // The variant only selects trouble's validation (no Flags check); the
     // PDU type set by `advertise` is unchanged.
     let data = Advertisement::NonconnectableScannableUndirected {
-        adv_data: ble_adv::adv_data(beacon),
+        adv_data: ble_adv::adv_data(adv),
         scan_data: scan_data.get(..len).unwrap_or(&[]),
     };
     match with_timeout(HCI_TIMEOUT, peripheral.update_adv_data(data)).await {
@@ -696,11 +1069,12 @@ async fn update(
 }
 
 /// Starts the connectable-scannable advertising set with Flags-only data,
-/// then installs `beacon` and the `name` scan response. Returns the handle
+/// then installs advertising data `adv` and the `name` scan response.
+/// Returns the handle
 /// that keeps it running.
 async fn start_advertising<'d>(
     peripheral: &mut Peripheral<'d, BleController, DefaultPacketPool>,
-    beacon: &[u8],
+    adv_data: &[u8],
     name: &str,
 ) -> Result<Adv<'d>, ErrorCode> {
     let (scan_data, len) = ble_adv::scan_response(name);
@@ -717,8 +1091,8 @@ async fn start_advertising<'d>(
         warn!("ble: advertising could not start");
         return Err(ErrorCode::Radio);
     };
-    if !beacon.is_empty() {
-        update(peripheral, beacon, name).await?;
+    if adv_data != ble_adv::DEFAULT_ADV_DATA {
+        update(peripheral, adv_data, name).await?;
     }
     info!("ble: advertising");
     Ok(handle)

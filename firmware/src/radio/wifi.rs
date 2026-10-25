@@ -10,24 +10,38 @@
 //!
 //! Every radio await is wrapped in a timeout; no credentials are compiled in.
 //!
-//! # LED sync over ESP-NOW (FR-31)
+//! # Middleware over ESP-NOW: LED sync (FR-31) and app keys (FR-37)
 //!
 //! The task also owns the ESP-NOW instance, obtained from the controller
 //! with `WifiController::esp_now` (it shares the started station interface;
-//! esp-radio pre-registers the broadcast peer). [`queue_beacon`] hands it the
-//! latest `Effect::SyncBroadcast` through [`SYNC_TX`] (latest wins, never
-//! blocks the dispatcher). The beacon's network time is advanced by the time
-//! it spent queued, then it is broadcast to `FF:FF:FF:FF:FF:FF` as a
-//! [`SyncBeacon`] (`OZL1` + id + network ms). Beacons are only sent while no
-//! scan or connect is running; one older than [`MAX_TX_AGE`] is dropped.
+//! esp-radio pre-registers the broadcast peer). Its sender and receiver
+//! halves are the [`EspNowRadio`] of a [`badge_mw::espnow::EspNowTransport`]
+//! (the middleware `Publisher` + `Subscriber` over ESP-NOW broadcast, frames
+//! `MW` v1: header, key, payload). Everything this task sends or receives
+//! over ESP-NOW goes through that transport.
 //!
-//! Received frames are served concurrently with the command loop and also
-//! while a scan or connect is in flight, so each is stamped with the embassy
-//! time at reception (esp-radio's RX timestamp is the Wi-Fi MAC's own
-//! microsecond timer, not the embassy time base, so it is not used). Frames
-//! from our own MAC or that do not decode are ignored; good ones become
-//! `Input::SyncBeacon` via `try_send` on [`RADIO_EVENTS`], counting drops
-//! when it is full instead of blocking.
+//! - **Sync beacons**: [`queue_beacon`] hands the task the latest
+//!   `Effect::SyncBroadcast` through [`SYNC_TX`] (latest wins, never blocks
+//!   the dispatcher). The beacon's network time is advanced by the time it
+//!   spent queued, then it is published on `keys::SYNC` with the
+//!   [`SyncBeacon`] wire bytes (`OZL1` + id + network ms) as payload. One
+//!   older than [`MAX_TX_AGE`] is dropped.
+//! - **App publishes**: messages from [`mw::ESPNOW_OUT`] whose key passes
+//!   `keys::app_may_use` are published as they are.
+//! - Nothing is sent while a scan or connect is running (beacons wait in
+//!   [`SYNC_TX`], app messages in [`mw::ESPNOW_OUT`]).
+//! - **Receiving**: the transport is subscribed to `keys::SYNC` and to the
+//!   `app/` prefix, ignores frames from our own MAC, and drops repeated
+//!   `(sender, key, seq)` frames. Received frames are served concurrently
+//!   with the command loop and also while a scan or connect is in flight, so
+//!   each sample is stamped with the embassy time at reception (esp-radio's
+//!   RX timestamp is the Wi-Fi MAC's own microsecond timer, not the embassy
+//!   time base, so it is not used). A SYNC sample whose payload decodes as a
+//!   beacon becomes `Input::SyncBeacon` via `try_send` on [`RADIO_EVENTS`];
+//!   an app sample goes to [`mw::APP_SAMPLES`] via `try_send`. Full queues
+//!   drop and count instead of blocking; malformed frames are counted.
+//! - Old firmware broadcast bare `OZL1` frames; those carry no `MW` magic
+//!   and are ignored, so this firmware does not sync with older firmware.
 //!
 //! Channel: when not associated the radio is parked on [`SYNC_CHANNEL`]
 //! (1) at start, after every scan and connect attempt, and by the
@@ -41,15 +55,20 @@ use core::pin::pin;
 
 use badge_core::io::{Input, MAX_APS, Millis};
 use badge_core::sync::SyncBeacon;
+use badge_mw::espnow::{
+    EspNowError as MwError, EspNowRadio, EspNowTransport, Key, MAX_KEY, MAX_PAYLOAD, Mac,
+    Publisher, Received,
+};
+use badge_mw::keys;
 use badge_proto::{AccessPoint, ErrorCode, WifiState};
 use defmt::{info, warn};
-use embassy_futures::select::{Either3, Either4, select3, select4};
+use embassy_futures::select::{Either, Either3, Either4, select, select3, select4};
 use embassy_net::Stack;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer, with_timeout};
-use esp_radio::esp_now::{BROADCAST_ADDRESS, EspNowReceiver, EspNowSender, ReceivedData};
+use esp_radio::esp_now::{BROADCAST_ADDRESS, EspNowError, EspNowReceiver, EspNowSender};
 use esp_radio::wifi::scan::ScanConfig;
 use esp_radio::wifi::sta::StationConfig;
 use esp_radio::wifi::{
@@ -60,6 +79,7 @@ use heapless::{String, Vec};
 
 use super::RADIO_EVENTS;
 use super::rank::{rank_aps, truncate_str};
+use crate::mw;
 
 /// Wi-Fi commands, split out of `Effect` by the dispatcher.
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +130,14 @@ pub const MAX_TX_AGE: Duration = Duration::from_millis(100);
 const SYNC_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 /// Log sync counters every this many received beacons.
 const SYNC_LOG_EVERY: u32 = 256;
+/// `(sender, key)` pairs the transport remembers for duplicate suppression.
+const DEDUP_ENTRIES: usize = 16;
+/// Room for any sample the transport delivers (key plus payload).
+const RX_BUF: usize = MAX_KEY + MAX_PAYLOAD;
+/// Exact keys the transport subscribes to.
+static SUB_KEYS: [Key<'static>; 1] = [keys::SYNC];
+/// Key prefixes the transport subscribes to (the wasm app keys).
+static SUB_PREFIXES: [&str; 1] = [keys::APP_PREFIX];
 
 /// A sync beacon waiting to be broadcast.
 #[derive(Debug, Clone, Copy)]
@@ -132,38 +160,96 @@ pub fn queue_beacon(id: u32, network_ms: u32) {
     });
 }
 
-/// ESP-NOW sync counters (all wrap).
+/// ESP-NOW counters (all wrap).
 #[derive(Debug, Clone, Copy, Default, defmt::Format)]
 struct SyncStats {
     /// Beacons forwarded to the core.
     rx: u32,
     /// Beacons dropped because [`RADIO_EVENTS`] was full.
     rx_dropped: u32,
-    /// Frames that were not sync beacons.
+    /// Malformed `MW` frames, SYNC payloads that are not beacons, and
+    /// receive errors.
     rx_bad: u32,
     /// Beacons broadcast.
     tx: u32,
     /// Broadcasts that failed, timed out or were too old to send.
     tx_failed: u32,
+    /// App samples forwarded to [`mw::APP_SAMPLES`].
+    app_rx: u32,
+    /// App samples dropped (queue full or too large for the bus).
+    app_rx_dropped: u32,
+    /// App messages broadcast.
+    app_tx: u32,
+    /// App messages refused, failed or timed out.
+    app_tx_failed: u32,
 }
+
+/// Why the ESP-NOW radio binding failed.
+#[derive(Debug, Clone, Copy, defmt::Format)]
+enum LinkError {
+    /// esp-radio refused or failed the send.
+    Send(EspNowError),
+    /// A received frame did not fit the transport's buffer.
+    TooLarge,
+}
+
+/// esp-radio's ESP-NOW halves as the middleware transport's radio.
+struct EspNowLink {
+    sender: EspNowSender,
+    receiver: EspNowReceiver,
+}
+
+impl EspNowRadio for EspNowLink {
+    type Error = LinkError;
+
+    async fn broadcast(&mut self, frame: &[u8]) -> Result<(), LinkError> {
+        self.sender
+            .send_async(&BROADCAST_ADDRESS, frame)
+            .await
+            .map_err(LinkError::Send)
+    }
+
+    async fn receive<'b>(&mut self, buf: &'b mut [u8]) -> Result<(&'b [u8], Mac), LinkError> {
+        // Cancel-safe: the frame is popped from esp-radio's queue only when
+        // the future completes.
+        let rx = self.receiver.receive_async().await;
+        let data = rx.data();
+        let slot = buf.get_mut(..data.len()).ok_or(LinkError::TooLarge)?;
+        slot.copy_from_slice(data);
+        Ok((slot, rx.info.src_address))
+    }
+}
+
+/// The middleware transport over ESP-NOW used by this task.
+type Transport = EspNowTransport<'static, EspNowLink, DEDUP_ENTRIES>;
+
+/// One receive outcome of the transport, borrowing the sample buffer.
+type RxResult<'b> = Result<Received<'b>, MwError<LinkError>>;
 
 /// The ESP-NOW half of the Wi-Fi task.
 struct SyncLink {
-    sender: EspNowSender,
-    receiver: EspNowReceiver,
-    /// Our station MAC, to ignore our own frames.
-    own_mac: [u8; 6],
+    transport: Transport,
     stats: SyncStats,
 }
 
 impl SyncLink {
-    /// Forwards one received frame to the core if it is a beacon from
-    /// someone else; `rx_at` is the embassy time it was taken off the queue.
-    fn received(&mut self, frame: &ReceivedData, rx_at: Millis) {
-        if frame.info.src_address == self.own_mac {
-            return;
+    /// Handles one receive outcome; `rx_at` is the embassy time it completed.
+    fn received(&mut self, rx: RxResult<'_>, rx_at: Millis) {
+        match rx {
+            Ok(r) if r.sample.key == keys::SYNC => self.sync_sample(r.sample.payload, rx_at),
+            Ok(r) if keys::app_may_use(r.sample.key.as_str()) => {
+                self.app_sample(r.sample.key.as_str(), r.sample.payload);
+            }
+            // Only reachable through a prefix the app may not use; and a run
+            // of ignored frames is not an error.
+            Ok(_) | Err(MwError::IgnoredLimit) => {}
+            Err(_) => self.stats.rx_bad = self.stats.rx_bad.wrapping_add(1),
         }
-        let Ok(beacon) = SyncBeacon::decode(frame.data()) else {
+    }
+
+    /// Forwards a SYNC payload to the core if it is a beacon.
+    fn sync_sample(&mut self, payload: &[u8], rx_at: Millis) {
+        let Ok(beacon) = SyncBeacon::decode(payload) else {
             self.stats.rx_bad = self.stats.rx_bad.wrapping_add(1);
             return;
         };
@@ -186,7 +272,23 @@ impl SyncLink {
         }
     }
 
-    /// Broadcasts `out`, its network time advanced by its queueing age.
+    /// Forwards an app sample to the wasm task, dropping it when the queue
+    /// is full or it does not fit the bus.
+    fn app_sample(&mut self, key: &str, payload: &[u8]) {
+        let mut msg = mw::MwMessage {
+            key: String::new(),
+            payload: Vec::new(),
+        };
+        let fits = msg.key.push_str(key).is_ok() && msg.payload.extend_from_slice(payload).is_ok();
+        if fits && mw::APP_SAMPLES.try_send(msg).is_ok() {
+            self.stats.app_rx = self.stats.app_rx.wrapping_add(1);
+        } else {
+            self.stats.app_rx_dropped = self.stats.app_rx_dropped.wrapping_add(1);
+        }
+    }
+
+    /// Publishes `out` on `keys::SYNC`, its network time advanced by its
+    /// queueing age.
     async fn send(&mut self, out: Outgoing) {
         let age = out.queued_at.elapsed();
         if age > MAX_TX_AGE {
@@ -199,18 +301,36 @@ impl SyncLink {
             ..out.beacon
         }
         .encode();
+        if self.publish(keys::SYNC, &wire).await {
+            self.stats.tx = self.stats.tx.wrapping_add(1);
+        } else {
+            self.stats.tx_failed = self.stats.tx_failed.wrapping_add(1);
+        }
+    }
+
+    /// Publishes an app message if its key is an app key.
+    async fn send_app(&mut self, msg: mw::MwMessage) {
+        let sent = match Key::new(msg.key.as_str()) {
+            Ok(key) if keys::app_may_use(key.as_str()) => self.publish(key, &msg.payload).await,
+            _ => false,
+        };
+        if sent {
+            self.stats.app_tx = self.stats.app_tx.wrapping_add(1);
+        } else {
+            self.stats.app_tx_failed = self.stats.app_tx_failed.wrapping_add(1);
+        }
+    }
+
+    /// Publishes through the transport within [`SYNC_SEND_TIMEOUT`]; true
+    /// on success.
+    async fn publish(&mut self, key: Key<'_>, payload: &[u8]) -> bool {
         // On timeout the send future is dropped before its callback; the
         // next send then resets the callback flag, so at worst one status is
-        // misattributed.
-        match with_timeout(
-            SYNC_SEND_TIMEOUT,
-            self.sender.send_async(&BROADCAST_ADDRESS, &wire),
+        // misattributed. The sequence number only advances on success.
+        matches!(
+            with_timeout(SYNC_SEND_TIMEOUT, self.transport.publish(key, payload)).await,
+            Ok(Ok(()))
         )
-        .await
-        {
-            Ok(Ok(())) => self.stats.tx = self.stats.tx.wrapping_add(1),
-            _ => self.stats.tx_failed = self.stats.tx_failed.wrapping_add(1),
-        }
     }
 }
 
@@ -287,19 +407,22 @@ fn observe(controller: &WifiController<'static>, stack: Stack<'static>, prev: &L
 }
 
 /// Owns the Wi-Fi controller and the ESP-NOW instance, and serves
-/// [`WIFI_CMDS`], [`SYNC_TX`] and received sync beacons forever.
+/// [`WIFI_CMDS`], [`SYNC_TX`], [`mw::ESPNOW_OUT`] and received ESP-NOW
+/// samples forever.
 ///
 /// Creating the ESP-NOW instance panics only if one already exists, which
 /// cannot happen: this task is its only creator and its pool size is one.
 #[embassy_executor::task]
 pub async fn wifi_task(mut controller: WifiController<'static>, stack: Stack<'static>) {
     let (_manager, sender, receiver) = controller.esp_now().split();
+    let transport = EspNowTransport::new(EspNowLink { sender, receiver }, &SUB_KEYS)
+        .with_prefixes(&SUB_PREFIXES)
+        .with_own_address(own_mac());
     let mut sync = SyncLink {
-        sender,
-        receiver,
-        own_mac: own_mac(),
+        transport,
         stats: SyncStats::default(),
     };
+    let mut rx_buf = [0u8; RX_BUF];
     park_channel(&mut controller);
     let mut link = Link::default();
     let mut next_poll = Instant::now() + POLL_INTERVAL;
@@ -307,8 +430,8 @@ pub async fn wifi_task(mut controller: WifiController<'static>, stack: Stack<'st
         let event = select4(
             WIFI_CMDS.receive(),
             Timer::at(next_poll),
-            sync.receiver.receive_async(),
-            SYNC_TX.wait(),
+            sync.transport.recv_from(&mut rx_buf),
+            select(SYNC_TX.wait(), mw::ESPNOW_OUT.receive()),
         )
         .await;
         match event {
@@ -319,8 +442,9 @@ pub async fn wifi_task(mut controller: WifiController<'static>, stack: Stack<'st
                 RADIO_EVENTS.send(answer).await;
                 next_poll = Instant::now() + POLL_INTERVAL;
             }
-            Either4::Third(frame) => sync.received(&frame, now_millis()),
-            Either4::Fourth(out) => sync.send(out).await,
+            Either4::Third(rx) => sync.received(rx, now_millis()),
+            Either4::Fourth(Either::First(out)) => sync.send(out).await,
+            Either4::Fourth(Either::Second(msg)) => sync.send_app(msg).await,
             Either4::Second(()) => {
                 next_poll = Instant::now() + POLL_INTERVAL;
                 park_channel(&mut controller);
@@ -403,22 +527,24 @@ async fn execute(
 
 /// Polls `op` to completion while answering any command that arrives in the
 /// meantime: scans/connects get `Busy`, status gets the last known `link`.
-/// Received sync beacons keep being stamped and forwarded; none are sent.
+/// Received ESP-NOW samples keep being stamped and forwarded; nothing is
+/// sent.
 ///
 /// Terminates when `op` does; callers bound `op` with a timeout.
 async fn while_busy<F: Future>(op: F, link: &Link, sync: &mut SyncLink) -> F::Output {
     let mut op = pin!(op);
+    let mut rx_buf = [0u8; RX_BUF];
     loop {
         match select3(
             op.as_mut(),
             WIFI_CMDS.receive(),
-            sync.receiver.receive_async(),
+            sync.transport.recv_from(&mut rx_buf),
         )
         .await
         {
             Either3::First(out) => return out,
             Either3::Second(cmd) => RADIO_EVENTS.send(busy_reply(&cmd, link)).await,
-            Either3::Third(frame) => sync.received(&frame, now_millis()),
+            Either3::Third(rx) => sync.received(rx, now_millis()),
         }
     }
 }

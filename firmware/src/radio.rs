@@ -14,7 +14,10 @@
 //!   `Input::Wifi { seq: None, .. }` whenever the link or DHCP lease changes
 //!   and unsolicited `Input::SyncBeacon` for received ESP-NOW sync beacons.
 //!   The BLE task adds unsolicited `Input::RadioPacket` (OZ adverts),
-//!   `Input::BleStats` (once a second) and `Input::Host` (GATT writes).
+//!   `Input::BleStats` (once a second) and `Input::Host` (GATT writes and
+//!   middleware RPC sets); it also advertises app publishes from
+//!   `mw::BLE_OUT` and delivers app samples heard in middleware adverts to
+//!   `mw::APP_SAMPLES`.
 //!
 //! Every command receives exactly one answer. A command that arrives while
 //! its radio is busy with a long operation (scan, connect) is answered
