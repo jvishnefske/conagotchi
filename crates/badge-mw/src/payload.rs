@@ -184,12 +184,15 @@ pub enum BootAction {
     Idle,
     /// Load and start the installed payload.
     Autostart,
-    /// An image is installed but BOOT was held at reset: leave it STOPPED.
+    /// An image is installed but the safe-mode button (SELECT) was held at
+    /// boot: leave it STOPPED.
     SafeMode,
 }
 
 /// Decides the boot action from whether a valid image is installed and
-/// whether the BOOT button was held at reset.
+/// whether the safe-mode button (SELECT) was held at boot. (Not BOOT: it is
+/// GPIO0, a strapping pin, and holding it through a reset enters the ROM
+/// download mode, so the firmware never runs.)
 pub fn boot_action(installed: bool, boot_held: bool) -> BootAction {
     match (installed, boot_held) {
         (false, _) => BootAction::Idle,
@@ -199,7 +202,7 @@ pub fn boot_action(installed: bool, boot_held: bool) -> BootAction {
 }
 
 /// True if `button` is held in a raw button sample (bit n = `Button(n)`),
-/// e.g. BOOT at reset for safe mode.
+/// e.g. SELECT at boot for safe mode.
 pub fn held(raw: ButtonMask, button: Button) -> bool {
     u32::try_from(button.0)
         .ok()

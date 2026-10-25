@@ -220,7 +220,7 @@ message GetLobby {}
 // Payload upload, mirroring middleware's loader (sys/loader/begin|chunk|
 // commit): Begin erases the payload partition, Chunks must arrive in order,
 // Commit verifies length and CRC-32 and persists the payload, which then
-// autostarts on boot (unless BOOT is held).
+// autostarts on boot (unless SELECT is held while the badge boots).
 message WasmBegin {
   uint32 len = 1;    // image length, at most the payload partition capacity
   uint32 crc32 = 2;  // CRC-32 (IEEE) of the whole image

@@ -11,8 +11,9 @@
 //! 3. the esp-rtos scheduler on TIMG0 / `FROM_CPU_INTR0`;
 //! 4. drivers: buttons, indicators, WS2812 chain, GC9A01 display and, in
 //!    `dev` builds only, the GPIO probe pins (each failure is logged and that
-//!    driver is left out); the buttons are sampled once here, and BOOT held
-//!    at reset selects payload safe mode;
+//!    driver is left out); the buttons are sampled once here, and SELECT held
+//!    while the badge boots selects payload safe mode (not BOOT, a strapping
+//!    pin that enters the ROM download mode when held through a reset);
 //! 5. the radio task ([`radio::start`]), the flash storage task
 //!    ([`storage::start`]: sole owner of `FLASH`; stored contacts and radio
 //!    key, first-boot import of the stock key, the `payload` partition), the
@@ -110,9 +111,10 @@ async fn main(spawner: Spawner) -> ! {
     );
     let indicators = Indicators::new(peripherals.GPIO2, peripherals.GPIO4);
     info!("buttons + indicators ready");
-    // BOOT held at reset: payload safe mode (the installed payload is not
-    // autostarted).
-    let boot_held = badge_mw::payload::held(buttons.sample(), badge_proto::Button::Boot);
+    // SELECT held while the badge boots: payload safe mode (the installed
+    // payload is not autostarted). Not BOOT: BOOT is GPIO0, a strapping pin,
+    // and holding it through a reset enters the ROM download mode instead.
+    let boot_held = badge_mw::payload::held(buttons.sample(), badge_proto::Button::Select);
 
     let leds = match Ws2812::new(peripherals.RMT, peripherals.GPIO45) {
         Ok(leds) => {

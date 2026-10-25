@@ -39,7 +39,7 @@
 //! # Boot
 //!
 //! On start the task asks the storage task whether a valid image is
-//! installed (header and CRC). If so it starts it, unless BOOT was held at
+//! installed (header and CRC). If so it starts it, unless SELECT was held at
 //! reset ([`start`]'s `boot_held`, sampled by `main`), which is safe mode:
 //! the payload stays installed and STOPPED and a warning is logged
 //! (`badge_mw::payload::boot_action`). The core loop does not wait for any
@@ -180,7 +180,7 @@ static DROPPED: AtomicU32 = AtomicU32::new(0);
 /// Longest single call into the payload, in microseconds.
 static MAX_CALL_US: AtomicU32 = AtomicU32::new(0);
 
-/// Spawns the wasm task. `boot_held`: BOOT was held at reset (safe mode, no
+/// Spawns the wasm task. `boot_held`: SELECT was held at boot (safe mode, no
 /// autostart).
 pub fn start(spawner: &Spawner, boot_held: bool) -> Result<(), WasmError> {
     spawner.spawn(wasm_task(boot_held).map_err(|_| WasmError::Spawn)?);
@@ -493,7 +493,7 @@ impl Runner {
         }
         match payload::boot_action(installed.is_some(), boot_held) {
             BootAction::Idle => info!("wasm: no payload installed"),
-            BootAction::SafeMode => warn!("wasm: BOOT held at reset: safe mode, payload not started"),
+            BootAction::SafeMode => warn!("wasm: SELECT held at boot: safe mode, payload not started"),
             BootAction::Autostart => {
                 info!("wasm: autostarting the installed payload");
                 if let Err(code) = self.start().await {
