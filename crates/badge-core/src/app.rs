@@ -246,6 +246,8 @@ pub struct App {
     ble_stats: BleSnapshot,
     /// LED sync clock.
     sync: SyncClock,
+    /// Payload upload state (middleware loader).
+    loader: middleware::loader::Loader,
 }
 
 /// Effects being collected for one `handle` call.
@@ -361,6 +363,7 @@ impl App {
             key: None,
             ble_stats: BleSnapshot::default(),
             sync: SyncClock::new(SyncClock::id_from_mac(&info.mac)),
+            loader: middleware::loader::Loader::Idle,
         }
     }
 
@@ -974,9 +977,12 @@ impl App {
             | Cmd::ListContacts(_)
             | Cmd::ClearContacts(_)
             | Cmd::GetLobby(_)) => self = self.trade_host(seq, cmd, out),
-            cmd @ (Cmd::WasmLoad(_) | Cmd::WasmStart(_) | Cmd::WasmStop(_) | Cmd::GetWasm(_)) => {
-                Self::wasm_host(seq, cmd, out);
-            }
+            cmd @ (Cmd::WasmBegin(_)
+            | Cmd::WasmChunk(_)
+            | Cmd::WasmCommit(_)
+            | Cmd::WasmStart(_)
+            | Cmd::WasmStop(_)
+            | Cmd::GetWasm(_)) => self = self.wasm_host(seq, cmd, out),
         }
         self
     }

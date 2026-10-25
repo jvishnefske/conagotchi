@@ -373,7 +373,7 @@ mod tests {
         let merged = std::fs::read(std::env::var("BADGECTL_TEST_MERGED").unwrap()).unwrap();
         let csv = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../firmware/partitions.csv");
         let image = elf_image(&elf, &csv).unwrap();
-        assert!(image.end() <= u64::from(crate::adopt::FLASH_IMAGE_END));
+        assert!(image.end() <= u64::from(crate::adopt::INSTALL_END));
         assert_eq!(image.merged(), merged);
     }
 

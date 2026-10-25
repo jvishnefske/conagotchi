@@ -27,9 +27,14 @@ dev = ["badge-core/dev"]
 badge-core  = { path = "../crates/badge-core" }
 badge-proto = { path = "../crates/badge-proto" }
 badge-mw    = { path = "../crates/badge-mw" }
-wasm-abi    = { path = "../crates/wasm-abi" }
-# Wasm app runtime (wasmi; allocates from the esp-alloc heap, see src/wasm.rs).
-wasm-runtime = { path = "../crates/wasm-runtime" }
+# Wasm payload runtime: middleware's wasm-host ("mw" ABI, wasmi; allocates
+# from the esp-alloc heap, see src/wasm.rs). Same rev as the host workspace.
+wasm-host  = { git = "https://github.com/jvishnefske/middleware", rev = "6b1720e8b4b7ef6983f53bb84227bbf759b1489d" }
+middleware = { git = "https://github.com/jvishnefske/middleware", rev = "6b1720e8b4b7ef6983f53bb84227bbf759b1489d", default-features = false }
+# Pure core of middleware's ESP base firmware, library only: the payload
+# partition layout and `store::PayloadStore` (src/wasm.rs, src/storage.rs).
+esp-base   = { git = "https://github.com/jvishnefske/middleware", rev = "6b1720e8b4b7ef6983f53bb84227bbf759b1489d", default-features = false }
+embedded-storage = "0.3.1"
 
 esp-hal = { version = "~1.2.2", features = ["defmt", "esp32s3", "unstable"] }
 
@@ -117,4 +122,8 @@ opt-level = "z"
 [profile.release.package.wasmi_ir]
 opt-level = "z"
 [profile.release.package.wasmparser]
+opt-level = "z"
+[profile.release.package.wasmi_core]
+opt-level = "z"
+[profile.release.package.wasmi_collections]
 opt-level = "z"

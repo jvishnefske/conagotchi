@@ -8,7 +8,8 @@
 //! 3. drains up to [`MAX_RADIO_PER_TICK`] results from
 //!    [`RADIO_EVENTS`];
 //!    then up to [`MAX_WASM_PER_TICK`] inputs from the wasm task
-//!    ([`wasm::try_next`]: command answers, app logs, app host messages);
+//!    ([`wasm::try_next`]: command answers, payload logs, payload badge
+//!    commands);
 //! 4. takes a pending `PROBE` mailbox command as `Input::Host`;
 //! 5. feeds follow-up inputs produced while executing effects (GPIO results,
 //!    `BUSY` answers when the radio queue is full), bounded per tick;
@@ -19,12 +20,15 @@
 //!
 //! Each input goes through `let (next, effects) = app.handle(input)`; the
 //! app value lives on this task's stack and is moved linearly, never shared.
-//! Effects are executed in order: `Send` → RTT, `Leds` → RMT,
+//! Effects are executed in order: `Send` → RTT (a button event also goes to
+//! the wasm task, [`wasm::button`], as a `badge/buttons` sample for the
+//! payload), `Leds` → RMT,
 //! `Indicator` → GPIO, `Draw` → panel, `GpioRead`/`GpioWrite` → probe pins
 //! with the result fed back, radio effects → [`RADIO_CMDS`], `LinkSend` →
 //! [`link_uart::send`], `SaveContact`/`ClearContacts` → [`storage::submit`]
 //! (both queue without waiting and drop when full), `Wasm` →
-//! [`wasm::submit`] (answered `BUSY` when its queue is full). `Redraw` is
+//! [`wasm::submit`] (answered `BUSY` when its queue is full; the wasm task
+//! answers every command it accepts exactly once, drained in step 3). `Redraw` is
 //! coalesced to one render per tick (a full render also covers a pending
 //! `Animate`); a pending render is flushed before any `Draw` so drawing order
 //! is preserved.
@@ -194,6 +198,9 @@ impl Shell {
     fn execute(&mut self, effect: Effect, app: &App) {
         match effect {
             Effect::Send(msg) => {
+                if let Some((button, pressed)) = badge_mw::payload::button_edge(&msg) {
+                    wasm::button(button, pressed);
+                }
                 if let Err(e) = self.hw.link.send(&msg) {
                     self.stats.send_errors = self.stats.send_errors.wrapping_add(1);
                     warn!("proto-up send failed: {}", e);

@@ -117,10 +117,6 @@ pub struct SimArgs {
     /// Load and start this wasm app on every badge right after boot.
     #[arg(long, value_name = "FILE")]
     pub app: Option<PathBuf>,
-    /// Extra app keys every badge subscribes to (keys only remote processes
-    /// publish on).
-    #[arg(long = "app-key", value_name = "KEY")]
-    pub app_keys: Vec<String>,
     /// MAC of badge 0 minus one, hex (use distinct bases per process with --zenoh).
     #[arg(long, value_parser = parse_u64, default_value = "0x0200c0ffee00")]
     pub mac_base: u64,
@@ -303,16 +299,17 @@ pub enum AdcCmd {
 /// `wasm` operations.
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum WasmOp {
-    /// Upload a module (chunked `WasmLoad`), then print the runtime status.
+    /// Install a module (`WasmBegin` with its length and CRC-32, 192-byte
+    /// `WasmChunk`s in order, `WasmCommit`), then print the payload status.
     Load {
-        /// The `.wasm` file (at most 16 KiB).
+        /// The `.wasm` file (1 byte to 16 KiB).
         file: PathBuf,
     },
-    /// Instantiate the loaded module and start ticking it.
+    /// Start the installed payload and tick it.
     Start,
-    /// Stop the app (the module stays loaded).
+    /// Stop the payload (it stays installed).
     Stop,
-    /// Runtime state, module size, ticks and fuel.
+    /// Payload state, image size, partition capacity and ticks.
     Status,
 }
 
@@ -349,7 +346,8 @@ pub struct AdoptArgs {
     #[arg(long)]
     pub force: bool,
     /// Image to flash: a firmware ELF (default: the release build) or a
-    /// merged `.bin` written at 0x0 (at most 0x200000 bytes).
+    /// merged `.bin` written at 0x0 (at most 0x1E0000 bytes: it must end
+    /// before the `payload` partition).
     #[arg(long)]
     pub source: Option<PathBuf>,
     /// Copy bootloader, partition table and factory app from the attached
@@ -741,13 +739,12 @@ mod tests {
         assert_eq!((a.badges, a.duration_ms, a.rssi, a.mac_base), (2, 10_000, -40, 0x0200_c0ff_ee00));
         assert!(!a.realtime && !a.events && a.zenoh.is_empty());
         let Ok(Command::Sim(a)) =
-            parse(&["sim", "--badges", "3", "--rssi", "-50", "--zenoh", "tcp/127.0.0.1:7447", "--app-key", "app/x"])
+            parse(&["sim", "--badges", "3", "--rssi", "-50", "--zenoh", "tcp/127.0.0.1:7447"])
         else {
             panic!("sim opts")
         };
         assert_eq!((a.badges, a.rssi), (3, -50));
         assert_eq!(a.zenoh, ["tcp/127.0.0.1:7447"]);
-        assert_eq!(a.app_keys, ["app/x"]);
         let cli = Cli::try_parse_from(["badgectl", "--sim", "1", "lobby"]).unwrap();
         assert_eq!((cli.sim, cli.sim_badges, cli.sim_warmup_ms), (Some(1), 2, 3000));
     }

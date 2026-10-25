@@ -45,7 +45,9 @@ pub enum GuestError {
     Rejected(&'static str),
 }
 
-/// A compiled `badge-sim` module.
+/// A compiled `badge-sim` module. A clone shares the compiled code (wasmi
+/// engine and module are reference-counted).
+#[derive(Clone)]
 pub struct SimModule {
     engine: Engine,
     module: Module,

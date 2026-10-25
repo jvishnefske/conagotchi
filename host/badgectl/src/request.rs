@@ -4,8 +4,9 @@
 //! subcommand, [`timeout_ms`] picks how long to wait for its response, and
 //! [`poke_words`] maps a `poke` subcommand onto the PROBE mailbox words.
 //! [`next_contacts_offset`] drives `contacts --all` paging and [`hint`]
-//! explains error responses that have a known cause. [`wasm_chunks`] splits
-//! a module into the `WasmLoad` requests of `wasm load`.
+//! explains error responses that have a known cause. [`wasm_plan`] turns a
+//! module into the `WasmBegin`, `WasmChunk`... and `WasmCommit` requests of
+//! `wasm load`.
 //! Capacity limits of the generated types are checked here so the user gets
 //! a clear message instead of a silently truncated field.
 
@@ -16,8 +17,8 @@ use badge_proto::{
     AdcRead, BleAdvertise, BleScan, Chi, ClearContacts, Contacts, DisplayFill, DisplayRect, DisplayText, ErrorCode,
     GetBleMetrics, GetButtons, GetInfo, GetLobby, GetSync, GpioRead, GpioWrite, HostMsg, HostMsg_::Cmd,
     Indicator, LedPattern, ListContacts, PetMode, Ping, Response, Response_::Body, Rgb, Screen, SetChi,
-    SetIndicator, SetLed, SetLeds, SetPattern, SetPetMode, ShowScreen, TradeCancel, TradeInvite, WasmLoad,
-    WasmStart, WasmStop, GetWasm, WifiConnect, WifiScan, WifiStatus,
+    SetIndicator, SetLed, SetLeds, SetPattern, SetPetMode, ShowScreen, TradeCancel, TradeInvite, WasmBegin,
+    WasmChunk, WasmCommit, WasmStart, WasmStop, GetWasm, WifiConnect, WifiScan, WifiStatus,
 };
 
 use crate::cli::{AdcCmd, 
@@ -44,7 +45,7 @@ pub enum RequestError {
     /// `leds` needs between 1 and 8 colours.
     #[error("expected 1 to 8 colours, got {0}")]
     LedCount(usize),
-    /// `wasm load` is several requests; see [`wasm_chunks`].
+    /// `wasm load` is several requests; see [`wasm_plan`].
     #[error("`wasm load` is an upload of several requests, not one")]
     Upload,
     /// The module is empty.
@@ -60,18 +61,23 @@ pub enum RequestError {
     },
 }
 
-/// Bytes per `WasmLoad` chunk (the protocol capacity of `WasmLoad.data`).
+/// Bytes per `WasmChunk` (the protocol capacity of `WasmChunk.data`).
 pub const WASM_CHUNK: usize = badge_core::io::WASM_CHUNK;
 
-/// Splits a module into in-order `WasmLoad` chunks of [`WASM_CHUNK`] bytes
-/// (the last one shorter), each carrying the full size.
+/// Largest module the badge accepts (`badge_core::board::PAYLOAD_MAX_IMAGE`).
+pub const WASM_MAX_MODULE: usize = badge_core::board::PAYLOAD_MAX_IMAGE as usize;
+
+/// The requests that upload `module`, in the order they must be sent:
+/// `WasmBegin { len, crc32 }` (CRC-32/ISO-HDLC of the whole module, from
+/// `middleware::crc::Crc32`), one `WasmChunk` per [`WASM_CHUNK`] bytes at
+/// increasing offsets (the last one shorter), then `WasmCommit`.
 ///
 /// # Errors
 ///
 /// [`RequestError::EmptyModule`], or [`RequestError::ModuleTooLarge`] above
-/// `wasm_abi::MAX_MODULE` (checked here so nothing is sent).
-pub fn wasm_chunks(module: &[u8]) -> Result<Vec<WasmLoad>, RequestError> {
-    let max = wasm_abi::MAX_MODULE;
+/// [`WASM_MAX_MODULE`] (checked here so nothing is sent).
+pub fn wasm_plan(module: &[u8]) -> Result<Vec<Cmd>, RequestError> {
+    let max = WASM_MAX_MODULE;
     if module.is_empty() {
         return Err(RequestError::EmptyModule);
     }
@@ -79,16 +85,17 @@ pub fn wasm_chunks(module: &[u8]) -> Result<Vec<WasmLoad>, RequestError> {
     if module.len() > max {
         return Err(too_large);
     }
-    let total = u32::try_from(module.len()).map_err(|_| too_large.clone())?;
-    module
-        .chunks(WASM_CHUNK)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let offset = u32::try_from(i * WASM_CHUNK).map_err(|_| too_large.clone())?;
-            let data = heapless::Vec::from_slice(chunk).map_err(|_| too_large.clone())?;
-            Ok(WasmLoad { offset, data, total })
-        })
-        .collect()
+    let len = u32::try_from(module.len()).map_err(|_| too_large.clone())?;
+    let crc32 = middleware::crc::Crc32::checksum(module);
+    let mut plan = Vec::with_capacity(module.len().div_ceil(WASM_CHUNK) + 2);
+    plan.push(Cmd::WasmBegin(WasmBegin { len, crc32 }));
+    for (i, chunk) in module.chunks(WASM_CHUNK).enumerate() {
+        let offset = u32::try_from(i * WASM_CHUNK).map_err(|_| too_large.clone())?;
+        let data = heapless::Vec::from_slice(chunk).map_err(|_| too_large.clone())?;
+        plan.push(Cmd::WasmChunk(WasmChunk { offset, data }));
+    }
+    plan.push(Cmd::WasmCommit(WasmCommit {}));
+    Ok(plan)
 }
 
 fn rgb(c: Color) -> Rgb {
@@ -375,30 +382,59 @@ mod tests {
         command(&parse(args), 42).expect("command")
     }
 
+    /// The chunks of a plan, as (offset, data).
+    fn chunks(plan: &[Cmd]) -> Vec<(u32, Vec<u8>)> {
+        plan.iter()
+            .filter_map(|c| match c {
+                Cmd::WasmChunk(c) => Some((c.offset, c.data.to_vec())),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn wasm_chunks_cover_the_module_in_order() {
+    fn wasm_plan_is_begin_chunks_commit() {
         let module: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        let chunks = wasm_chunks(&module).unwrap();
-        assert_eq!(chunks.len(), 6);
-        for (i, c) in chunks.iter().enumerate() {
-            assert_eq!(c.offset as usize, i * WASM_CHUNK);
-            assert_eq!(c.total, 1000);
+        let plan = wasm_plan(&module).unwrap();
+        assert_eq!(plan.len(), 1 + 6 + 1);
+        let crc32 = middleware::crc::Crc32::checksum(&module);
+        assert_eq!(plan[0], Cmd::WasmBegin(WasmBegin { len: 1000, crc32 }));
+        assert_eq!(plan[7], Cmd::WasmCommit(WasmCommit {}));
+        assert!(plan[1..7].iter().all(|c| matches!(c, Cmd::WasmChunk(_))));
+        let chunks = chunks(&plan);
+        for (i, (offset, _)) in chunks.iter().enumerate() {
+            assert_eq!(*offset as usize, i * WASM_CHUNK);
         }
-        assert!(chunks[..5].iter().all(|c| c.data.len() == 192));
-        assert_eq!(chunks[5].data.len(), 1000 - 5 * 192, "last chunk is partial");
-        let joined: Vec<u8> = chunks.iter().flat_map(|c| c.data.iter().copied()).collect();
+        assert!(chunks[..5].iter().all(|(_, d)| d.len() == 192));
+        assert_eq!(chunks[5].1.len(), 1000 - 5 * 192, "last chunk is partial");
+        let joined: Vec<u8> = chunks.iter().flat_map(|(_, d)| d.iter().copied()).collect();
         assert_eq!(joined, module);
-        let exact = wasm_chunks(&[7; 384]).unwrap();
-        assert_eq!((exact.len(), exact[1].offset, exact[1].data.len()), (2, 192, 192));
-        assert_eq!(wasm_chunks(&[1]).unwrap()[0].data.as_slice(), &[1]);
+    }
+
+    #[test]
+    fn wasm_plan_exact_and_single_byte_modules() {
+        let exact = chunks(&wasm_plan(&[7; 384]).unwrap());
+        assert_eq!((exact.len(), exact[1].0, exact[1].1.len()), (2, 192, 192));
+        let one = wasm_plan(&[1]).unwrap();
+        assert_eq!(one.len(), 3);
+        assert_eq!(chunks(&one), vec![(0, vec![1])]);
+    }
+
+    #[test]
+    fn wasm_plan_crc_is_crc32_iso_hdlc() {
+        // The standard CRC-32 check value, so begin carries the IEEE CRC.
+        let Cmd::WasmBegin(b) = &wasm_plan(b"123456789").unwrap()[0] else { panic!("begin first") };
+        assert_eq!((b.len, b.crc32), (9, 0xCBF4_3926));
+        assert_eq!(b.crc32, middleware::crc::Crc32::checksum(b"123456789"));
     }
 
     #[test]
     fn wasm_modules_over_16k_or_empty_are_refused_locally() {
-        assert_eq!(wasm_chunks(&[]), Err(RequestError::EmptyModule));
-        assert_eq!(wasm_chunks(&vec![0; 16 * 1024]).map(|c| c.len()), Ok(86));
+        assert_eq!(WASM_MAX_MODULE, 16 * 1024);
+        assert_eq!(wasm_plan(&[]), Err(RequestError::EmptyModule));
+        assert_eq!(wasm_plan(&vec![0; 16 * 1024]).map(|c| c.len()), Ok(86 + 2));
         assert_eq!(
-            wasm_chunks(&vec![0; 16 * 1024 + 1]),
+            wasm_plan(&vec![0; 16 * 1024 + 1]),
             Err(RequestError::ModuleTooLarge { len: 16 * 1024 + 1, max: 16 * 1024 })
         );
     }

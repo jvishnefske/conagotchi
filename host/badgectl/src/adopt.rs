@@ -21,9 +21,19 @@
 //! 4. Unless `--no-backup`, flash 0x0..[`FLASH_IMAGE_END`] is read to
 //!    `~/.local/share/conagotchi/backups/<mac>.bin` ([`backup_path`]); an
 //!    existing backup is never overwritten without `--force`.
-//! 5. The image is written. Only 0x0..0x200000 is ever touched: the `conag`
-//!    data partition at 0x200000 (contacts, radio key) and the stock `vfs`
-//!    and `doom` partitions after it survive.
+//! 5. The image is written. It must end at or below [`INSTALL_END`]
+//!    (0x1E0000, the end of the factory partition 0x10000..0x1E0000), so
+//!    the `payload` data partition at 0x1E0000..0x200000 (the installed wasm
+//!    app) keeps its contents, and the `conag` data partition at 0x200000
+//!    (contacts, radio key) and the stock `vfs` and `doom` partitions after
+//!    it are never touched.
+//!
+//! The backup (and `restore`) covers 0x0..[`FLASH_IMAGE_END`] (0x200000):
+//! bootloader, partition table, nvs, phy_init, the factory app and the
+//! `payload` partition. On a stock badge 0x1E0000..0x200000 is the tail of
+//! the stock factory partition (0x10000..0x200000), so the backup restores
+//! the stock firmware completely; on an adopted badge it also brings back
+//! the wasm app that was installed when the backup was taken.
 //! 6. The badge must come up with RTT within [`RTT_WAIT_MS`]. If it does not,
 //!    or the ROM banner says it is waiting for a download
 //!    ([`classify_boot`]), the user is asked to replug it once
@@ -61,8 +71,17 @@ pub const ESP_VID: u16 = 0x303a;
 /// Product id of the USB-Serial-JTAG peripheral (ESP32-S3, C3, C6...).
 pub const ESP_JTAG_PID: u16 = 0x1001;
 
-/// First flash byte the installer never touches (start of `conag`).
-pub const FLASH_IMAGE_END: u32 = 0x20_0000;
+/// End of the backup and restore range (start of `conag`): nothing at or
+/// above it is ever read into a backup or written. It is also the end of the
+/// `payload` partition.
+pub const FLASH_IMAGE_END: u32 = PAYLOAD_ADDR + PAYLOAD_LEN;
+/// Start of the `payload` data partition (the installed wasm app), and the
+/// first byte an installed image may not reach.
+pub const PAYLOAD_ADDR: u32 = 0x1E_0000;
+/// Size of the `payload` data partition (0x1E0000..0x200000).
+pub const PAYLOAD_LEN: u32 = 0x2_0000;
+/// End of an installed image (end of the factory partition).
+pub const INSTALL_END: u32 = PAYLOAD_ADDR;
 /// Bootloader offset.
 pub const BOOTLOADER_ADDR: u32 = 0x0;
 /// Largest bootloader (it must end before the partition table).
@@ -73,9 +92,10 @@ pub const PARTITION_TABLE_ADDR: u32 = 0x8000;
 pub const PARTITION_TABLE_MAX: u32 = 0x1000;
 /// Factory app offset.
 pub const APP_ADDR: u32 = 0x1_0000;
-/// Factory partition size (0x10000..0x200000).
-pub const APP_MAX: u32 = 0x1F_0000;
-/// Size of an `adopt` backup: everything below [`FLASH_IMAGE_END`].
+/// Factory partition size (0x10000..0x1E0000).
+pub const APP_MAX: u32 = INSTALL_END - APP_ADDR;
+/// Size of an `adopt` backup: everything below [`FLASH_IMAGE_END`],
+/// including the `payload` partition.
 pub const BACKUP_LEN: u32 = FLASH_IMAGE_END;
 /// First byte of an ESP application or bootloader image header.
 pub const ESP_IMAGE_MAGIC: u8 = 0xE9;
@@ -89,7 +109,8 @@ pub const BOOT_CAPTURE_MS: u64 = 1500;
 /// Upper bound on the replug wait (unplug + plug), in polls.
 pub const REPLUG_MAX_POLLS: u32 = 180;
 
-/// Flash regions copied by `--from-badge`: (name, offset, length).
+/// Flash regions copied by `--from-badge`: (name, offset, length). Only the
+/// factory partition of the app is copied, never the `payload` partition.
 pub const CLONE_REGIONS: [(&str, u32, u32); 3] = [
     ("bootloader", BOOTLOADER_ADDR, BOOTLOADER_MAX),
     ("partition table", PARTITION_TABLE_ADDR, PARTITION_TABLE_MAX),
@@ -361,24 +382,25 @@ impl FlashImage {
         Ok(Self { segments })
     }
 
-    /// A merged binary to be written at 0x0 (at most [`FLASH_IMAGE_END`]
-    /// bytes).
+    /// A merged binary to be written at 0x0 (at most [`INSTALL_END`]
+    /// bytes, so the `payload` partition is not overwritten).
     pub fn from_merged(bin: Vec<u8>) -> Result<Self, AdoptError> {
         if bin.is_empty() {
             return Err(AdoptError::Empty);
         }
-        if bin.len() > FLASH_IMAGE_END as usize {
-            return Err(AdoptError::TooLarge { name: "merged image", addr: 0, len: bin.len(), max: FLASH_IMAGE_END });
+        if bin.len() > INSTALL_END as usize {
+            return Err(AdoptError::TooLarge { name: "merged image", addr: 0, len: bin.len(), max: INSTALL_END });
         }
         Ok(Self { segments: vec![Segment { addr: 0, data: bin }] })
     }
 
-    /// An `adopt` backup (exactly [`BACKUP_LEN`] bytes) to write back at 0x0.
+    /// An `adopt` backup (exactly [`BACKUP_LEN`] bytes, `payload` partition
+    /// included) to write back at 0x0.
     pub fn from_backup(bin: Vec<u8>) -> Result<Self, AdoptError> {
         if bin.len() != BACKUP_LEN as usize {
             return Err(AdoptError::BackupSize { len: bin.len() });
         }
-        Self::from_merged(bin)
+        Ok(Self { segments: vec![Segment { addr: 0, data: bin }] })
     }
 
     /// Segments in offset order.
@@ -386,7 +408,8 @@ impl FlashImage {
         &self.segments
     }
 
-    /// First offset after the image (never above [`FLASH_IMAGE_END`]).
+    /// First offset after the image (never above [`INSTALL_END`], except a
+    /// backup, which ends at [`FLASH_IMAGE_END`]).
     pub fn end(&self) -> u64 {
         self.segments.iter().map(Segment::end).max().unwrap_or(0)
     }
@@ -397,7 +420,7 @@ impl FlashImage {
     }
 
     /// One binary for offset 0x0: gaps filled with 0xFF, no padding after
-    /// the last segment (so nothing at or above 0x200000 is erased). This
+    /// the last segment (so nothing past the image is erased). This
     /// is what `espflash save-image --merge --skip-padding` produces; the
     /// flashing paths write the segments instead, so only the tests use it.
     #[cfg(test)]
@@ -837,10 +860,12 @@ mod tests {
         assert!(merged[0x8002..0x10000].iter().all(|&b| b == 0xFF));
         assert_eq!(&merged[0x10000..], app(8).as_slice());
 
-        // The biggest app ends exactly at 0x200000; one more byte is rejected.
+        // The biggest app ends exactly at 0x1E0000 (the payload partition);
+        // one more byte is rejected.
+        assert_eq!((APP_MAX, INSTALL_END, PAYLOAD_ADDR, PAYLOAD_LEN), (0x1D_0000, 0x1E_0000, 0x1E_0000, 0x2_0000));
         let full = FlashImage::from_parts(vec![0xE9], vec![0xAA], app(APP_MAX as usize)).unwrap();
-        assert_eq!(full.end(), u64::from(FLASH_IMAGE_END));
-        assert_eq!(full.merged().len(), FLASH_IMAGE_END as usize);
+        assert_eq!(full.end(), u64::from(INSTALL_END));
+        assert_eq!(full.merged().len(), INSTALL_END as usize);
         assert!(matches!(
             FlashImage::from_parts(vec![0xE9], vec![0xAA], app(APP_MAX as usize + 1)),
             Err(AdoptError::TooLarge { name: "app", .. })
@@ -867,6 +892,10 @@ mod tests {
             Err(AdoptError::UnexpectedSegment(0x200000))
         );
         assert_eq!(
+            FlashImage::from_segments(vec![seg(0x10000, 4), seg(PAYLOAD_ADDR, 4)]),
+            Err(AdoptError::UnexpectedSegment(PAYLOAD_ADDR))
+        );
+        assert_eq!(
             FlashImage::from_segments(vec![seg(0x10000, 4), seg(0x9000, 4)]),
             Err(AdoptError::UnexpectedSegment(0x9000))
         );
@@ -884,12 +913,17 @@ mod tests {
         assert_eq!(bin.segments().len(), 1);
         assert_eq!(bin.end(), 0x1000);
         assert_eq!(FlashImage::from_merged(vec![]), Err(AdoptError::Empty));
+        // A merged image must stop before the payload partition.
         assert!(matches!(
-            FlashImage::from_merged(vec![0; FLASH_IMAGE_END as usize + 1]),
-            Err(AdoptError::TooLarge { name: "merged image", .. })
+            FlashImage::from_merged(vec![0; INSTALL_END as usize + 1]),
+            Err(AdoptError::TooLarge { name: "merged image", max: INSTALL_END, .. })
         ));
-        assert!(FlashImage::from_merged(vec![0; FLASH_IMAGE_END as usize]).is_ok());
-        assert!(FlashImage::from_backup(vec![0; BACKUP_LEN as usize]).is_ok());
+        assert!(FlashImage::from_merged(vec![0; INSTALL_END as usize]).is_ok());
+        assert!(FlashImage::from_merged(vec![0; FLASH_IMAGE_END as usize]).is_err());
+        // A backup covers the payload partition too (0x0..0x200000).
+        assert_eq!(BACKUP_LEN, 0x20_0000);
+        let backup = FlashImage::from_backup(vec![0; BACKUP_LEN as usize]).unwrap();
+        assert_eq!(backup.end(), u64::from(FLASH_IMAGE_END));
         assert_eq!(FlashImage::from_backup(vec![0; 0x1000]), Err(AdoptError::BackupSize { len: 0x1000 }));
         // A full 8 MB dump must never be restored over conag/vfs.
         assert!(FlashImage::from_backup(vec![0; 0x80_0000]).is_err());
@@ -1167,6 +1201,7 @@ mod tests {
         src[0x9000] = 0x42; // nvs: must not be copied
         src[0x10000] = 0xE9;
         src[0x10001] = 0x05;
+        src[0x1E0000] = 0x66; // payload: must not be copied
         src[0x200000] = 0x77; // conag: must not be copied
         let mut hw = Fake::with_lists(vec![vec![esp(A)], vec![esp(A), esp(B)]]);
         hw.flash.insert(mac(A), src);
@@ -1174,13 +1209,13 @@ mod tests {
         let o = AdoptOptions { yes: true, ..opts(false) };
         let out = run_adopt(&mut hw, &o, ImageSource::Badge(mac(A))).unwrap();
         assert!(matches!(out, AdoptOutcome::Adopted { mac: m, .. } if m == mac(B)));
-        assert_eq!(hw.reads, [(mac(A), 0, 0x8000), (mac(A), 0x8000, 0x1000), (mac(A), 0x10000, 0x1F_0000)]);
+        assert_eq!(hw.reads, [(mac(A), 0, 0x8000), (mac(A), 0x8000, 0x1000), (mac(A), 0x10000, 0x1D_0000)]);
         let (target, written) = &hw.jtag_writes[0];
         assert_eq!(*target, mac(B));
         let addrs: Vec<u32> = written.segments().iter().map(|s| s.addr).collect();
         assert_eq!(addrs, [0, 0x8000, 0x10000]);
         assert_eq!(written.segments()[2].data, [0xE9, 0x05, 0xFF, 0xFF]);
-        assert!(written.end() <= u64::from(FLASH_IMAGE_END));
+        assert!(written.end() <= u64::from(INSTALL_END));
     }
 
     #[test]

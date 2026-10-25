@@ -70,6 +70,7 @@ dependencies = [
  "embedded-graphics",
  "heapless 0.9.3",
  "hmac",
+ "middleware",
  "qrcode",
  "sha2 0.10.9",
 ]
@@ -278,13 +279,16 @@ dependencies = [
  "embedded-hal-bus",
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
+ "embedded-storage",
  "esp-alloc",
+ "esp-base",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-radio",
  "esp-rtos",
  "esp-storage",
  "heapless 0.9.3",
+ "middleware",
  "mipidsi",
  "panic-rtt-target",
  "rtt-target",
@@ -292,8 +296,7 @@ dependencies = [
  "smoltcp 0.14.0",
  "static_cell",
  "trouble-host",
- "wasm-abi",
- "wasm-runtime",
+ "wasm-host",
 ]
 
 [[package]]
@@ -980,6 +983,16 @@ dependencies = [
  "esp-sync",
  "linked_list_allocator",
  "rlsf",
+]
+
+[[package]]
+name = "esp-base"
+version = "0.1.0"
+source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
+dependencies = [
+ "embedded-storage",
+ "heapless 0.9.3",
+ "middleware",
 ]
 
 [[package]]
@@ -1942,8 +1955,11 @@ dependencies = [
 
 [[package]]
 name = "middleware"
-version = "0.1.0"
-source = "git+https://github.com/jvishnefske/middleware?rev=cd70573eca16186cb30352c3983ed862d2bdf477#cd70573eca16186cb30352c3983ed862d2bdf477"
+version = "0.2.0"
+source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
+dependencies = [
+ "embedded-io-async 0.7.0",
+]
 
 [[package]]
 name = "miette"
@@ -2925,10 +2941,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 
 [[package]]
-name = "wasm-abi"
-version = "0.1.0"
-
-[[package]]
 name = "wasm-bindgen"
 version = "0.2.129"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2974,12 +2986,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-runtime"
+name = "wasm-host"
 version = "0.1.0"
+source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
 dependencies = [
- "badge-proto",
- "heapless 0.9.3",
- "wasm-abi",
+ "middleware",
  "wasmi",
 ]
 

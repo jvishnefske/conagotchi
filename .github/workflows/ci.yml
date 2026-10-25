@@ -37,7 +37,11 @@ jobs:
 
   # The simulator module and the wasm apps, built for wasm32 on their own
   # (badgectl embeds the module, but this checks the wasm32 build and lints
-  # it for the target it runs on).
+  # it for the target it runs on). apps/hello is its own cargo workspace on
+  # middleware's mw-payload SDK (a git dependency fetched by cargo, pinned
+  # by apps/hello/Cargo.lock); build-apps.sh builds it with 1-byte pages and
+  # remapped paths, so the committed apps/hello.wasm must match byte for
+  # byte.
   wasm:
     runs-on: ubuntu-24.04
     steps:
@@ -49,6 +53,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: wasm
+          workspaces: |
+            . -> target
+            apps/hello -> target/apps
       - name: badge-sim for wasm32
         run: cargo build -p badge-sim --release --locked --target wasm32-unknown-unknown
       - name: badge-sim clippy for wasm32

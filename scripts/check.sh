@@ -4,7 +4,8 @@
 # Host workspace: tests and clippy (-D warnings), without and with
 # `--features badge-core/dev`, plus the no_std build of badge-core for
 # thumbv7em-none-eabihf; badge-sim for wasm32 and apps/hello.wasm freshness. Firmware: release build and clippy, default and
-# `--features dev`, using the esp toolchain from ~/export-esp-new.sh.
+# `--features dev`, using the esp toolchain from ~/export-esp-new.sh, and the
+# app image size (espflash save-image) against the 0x1D0000 factory partition.
 #
 # Environment:
 #   SKIP_FIRMWARE=1   skip the firmware part (e.g. no esp toolchain installed);
@@ -61,6 +62,17 @@ else
             cargo build --release $features
             step "firmware clippy ($label)"
             cargo clippy --release $features -- -D warnings
+            step "firmware app image fits factory 0x1D0000 ($label)"
+            image="$(mktemp)"
+            espflash save-image --chip esp32s3 --flash-size 8mb \
+                target/xtensa-esp32s3-none-elf/release/conagotchi-fw "$image" >/dev/null
+            size="$(stat -c %s "$image")"
+            rm -f "$image"
+            echo "app image $size of $((0x1D0000)) bytes"
+            if (( size > 0x1D0000 )); then
+                echo "error: app image exceeds the factory partition (partitions.csv)" >&2
+                exit 1
+            fi
         }
     done
 fi

@@ -92,26 +92,28 @@ pub fn via_name(v: Via) -> String {
     }
 }
 
-/// Name of a `WasmState` value.
+/// Name of a `WasmState` value (the values of
+/// `middleware::loader::PayloadStatus`).
 pub fn wasm_state_name(w: WasmState) -> String {
     match w {
         WasmState::Empty => "EMPTY".into(),
-        WasmState::Loading => "LOADING".into(),
-        WasmState::Loaded => "LOADED".into(),
+        WasmState::Stopped => "STOPPED".into(),
         WasmState::Running => "RUNNING".into(),
         WasmState::Trapped => "TRAPPED".into(),
+        WasmState::Loading => "LOADING".into(),
         WasmState(n) => format!("WASM_STATE({n})"),
     }
 }
 
-/// Human-readable wasm runtime status (one line, plus the error if any).
+/// Human-readable payload status: state, image size (bytes received while
+/// loading) out of the partition capacity, and ticks; plus the error if any.
 pub fn wasm_status_text(w: &WasmStatus) -> String {
     let mut out = format!(
-        "wasm {} size {} B, {} tick(s), {} fuel",
+        "wasm {} size {}/{} B, {} tick(s)",
         wasm_state_name(w.state),
         w.size,
-        w.ticks,
-        w.fuel_used
+        w.capacity,
+        w.ticks
     );
     if !w.error.is_empty() {
         let _ = write!(out, "\nerror: {}", w.error);
@@ -119,11 +121,11 @@ pub fn wasm_status_text(w: &WasmStatus) -> String {
     out
 }
 
-/// JSON body of a wasm runtime status.
+/// JSON body of a payload status.
 pub fn wasm_status_json(w: &WasmStatus) -> Value {
     json!({
         "type": "wasm", "state": wasm_state_name(w.state), "state_value": w.state.0,
-        "size": w.size, "fuel_used": w.fuel_used, "ticks": w.ticks,
+        "size": w.size, "capacity": w.capacity, "ticks": w.ticks,
         "error": if w.error.is_empty() { Value::Null } else { Value::from(w.error.as_str()) },
     })
 }
@@ -912,23 +914,35 @@ mod tests {
 
     #[test]
     fn wasm_status_and_log() {
-        let w = WasmStatus { state: WasmState::Running, size: 1234, fuel_used: 99, ticks: 7, error: hs("") };
-        assert_eq!(response_text(&resp(Body::Wasm(w.clone()))), "wasm RUNNING size 1234 B, 7 tick(s), 99 fuel");
+        let w = WasmStatus { state: WasmState::Running, size: 1234, capacity: 16384, ticks: 7, error: hs("") };
+        assert_eq!(response_text(&resp(Body::Wasm(w.clone()))), "wasm RUNNING size 1234/16384 B, 7 tick(s)");
         let j = response_json(&resp(Body::Wasm(w)));
         assert_eq!(j["body"]["type"], "wasm");
         assert_eq!(j["body"]["state"], "RUNNING");
-        assert_eq!(j["body"]["state_value"], 3);
+        assert_eq!(j["body"]["state_value"], 2);
         assert_eq!(j["body"]["size"], 1234);
-        assert_eq!(j["body"]["fuel_used"], 99);
+        assert_eq!(j["body"]["capacity"], 16384);
+        assert!(j["body"].get("fuel_used").is_none());
         assert_eq!(j["body"]["ticks"], 7);
         assert_eq!(j["body"]["error"], Value::Null);
         let t = WasmStatus { state: WasmState::Trapped, error: hs("out of fuel"), ..WasmStatus::default() };
         let text = response_text(&resp(Body::Wasm(t.clone())));
-        assert!(text.starts_with("wasm TRAPPED size 0 B") && text.ends_with("\nerror: out of fuel"), "{text}");
+        assert!(text.starts_with("wasm TRAPPED size 0/0 B") && text.ends_with("\nerror: out of fuel"), "{text}");
         assert_eq!(response_json(&resp(Body::Wasm(t)))["body"]["error"], "out of fuel");
-        assert_eq!(wasm_state_name(WasmState::Empty), "EMPTY");
-        assert_eq!(wasm_state_name(WasmState::Loading), "LOADING");
-        assert_eq!(wasm_state_name(WasmState::Loaded), "LOADED");
+        // Same numbering as middleware's PayloadStatus.
+        use middleware::loader::PayloadStatus as P;
+        for (state, name) in [
+            (P::Empty, "EMPTY"),
+            (P::Stopped, "STOPPED"),
+            (P::Running, "RUNNING"),
+            (P::Trapped, "TRAPPED"),
+            (P::Loading, "LOADING"),
+        ] {
+            assert_eq!(wasm_state_name(WasmState(state as i32)), name);
+        }
+        let loading = WasmStatus { state: WasmState::Loading, size: 384, capacity: 16384, ..WasmStatus::default() };
+        assert_eq!(wasm_status_text(&loading), "wasm LOADING size 384/16384 B, 0 tick(s)");
+        assert_eq!(wasm_status_json(&loading)["state_value"], 4);
         assert_eq!(wasm_state_name(WasmState(9)), "WASM_STATE(9)");
         let log = Event { kind: Some(Event_::Kind::WasmLog(badge_proto::WasmLog { text: hs("hi there") })) };
         assert_eq!(event_text(&log), "event: wasm log: hi there");

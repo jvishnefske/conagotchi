@@ -7,7 +7,8 @@
 //!    boots at `i * stagger_ms`, so the badges' local clocks differ and LED
 //!    sync has something to do.
 //! 2. Each booted badge gets a tick at its local time (time since its own
-//!    boot) and its wasm app, if one runs, gets one `tick`.
+//!    boot), with its simulated button levels, and its payload gets a
+//!    `tick` if one is due (the payload clock is the badge's uptime).
 //! 3. A badge's current advert (its last `Beacon`) is re-published every
 //!    `adv_interval_ms`, as the firmware's advertiser repeats it.
 //! 4. Every badge drains its subscriptions.
@@ -23,31 +24,33 @@
 //! - `Sync` is published at once on `keys::SYNC` as `SyncBeacon` wire bytes;
 //!   receivers get `SyncBeacon` with `rx_at` = their local time plus
 //!   `latency_ms` (the firmware's assumed ESP-NOW latency);
-//! - `Wasm` runs on the badge's [`AppSlot`] and is answered with
-//!   `sim_input_wasm`; app publishes go to the bus and arrive at every
-//!   badge whose app subscribed to the key;
+//! - `Wasm` runs on the badge's [`AppSlot`] (payload store and
+//!   `wasm-host` runtime) and is answered with `sim_input_wasm`;
+//! - `Send` of a `ButtonEvent` also goes to the payload as a
+//!   `badge/buttons` sample (`keys::button_sample`), as on the badge;
 //! - `Leds` and `Screen` update [`Node::leds`] and the PNG dirty flag;
 //!   link-UART frames, indicators and contact storage have no simulated
 //!   hardware and are dropped.
 //!
+//! Payload actions ([`AppAction`]) are carried out like the firmware does:
+//! log lines become `WasmLog` inputs, `badge/*` publishes become host
+//! messages with seq `WASM_SEQ`, and `app/...` publishes go to the bus.
+//!
 //! Every payload on the bus carries the sender's MAC first
 //! ([`super::bus::envelope`]); a badge ignores its own samples.
 //!
-//! App keys: the middleware has no wildcard subscriptions, so the bus
-//! subscriptions follow the apps: after every app command and tick, every
-//! key in `Runtime::subscriptions()` of any local app gets a bus
-//! subscription on every badge (keys local apps publish on and the keys
-//! in [`WorldConfig::app_keys`] are subscribed too). A badge whose app did
-//! not subscribe ignores the sample (`Runtime::deliver`).
-
-use std::collections::BTreeSet;
+//! App keys: every badge subscribes to the `app` prefix
+//! (`KeyFilter::Prefix`, middleware 0.2) once, so it receives every
+//! `app/...` sample whatever its payload subscribed to; the payload gets
+//! the samples whose key it subscribed to exactly (`Payload::deliver`).
 
 use badge_core::color::Color;
 use badge_core::frame;
 use badge_core::oz::{self, PeerId};
 use badge_core::sync::SyncBeacon;
 use badge_mw::keys;
-use badge_proto::{BadgeMsg, BadgeMsg_, HOST_MSG_MAX, HostMsg};
+use badge_proto::{BadgeMsg, BadgeMsg_, Event_, HOST_MSG_MAX, HostMsg};
+use middleware::{Key, KeyFilter};
 use badge_sim::inputs::VIA_BLE;
 use badge_sim::wire::{DecodeError, Record, Records};
 
@@ -85,8 +88,6 @@ pub struct WorldConfig {
     pub adv_interval_ms: u64,
     /// Added to `rx_at` of received sync beacons.
     pub latency_ms: u64,
-    /// App keys every badge subscribes to from the start.
-    pub app_keys: Vec<String>,
 }
 
 impl Default for WorldConfig {
@@ -99,7 +100,6 @@ impl Default for WorldConfig {
             rssi: -40,
             adv_interval_ms: 100,
             latency_ms: u64::from(badge_core::sync::RX_LATENCY_MS),
-            app_keys: Vec::new(),
         }
     }
 }
@@ -146,14 +146,14 @@ pub struct Node<S> {
     booted: bool,
     advert: Option<Vec<u8>>,
     next_adv: u64,
-    subs: Vec<(String, S)>,
+    subs: Vec<S>,
     app: AppSlot,
+    buttons: u8,
     link: bool,
     up: Vec<u8>,
     down: frame::Decoder<DOWN_FRAME_MAX>,
     history: Vec<(u64, BadgeMsg_::Kind)>,
     leds: Option<[Color; badge_core::board::led::RGB_COUNT]>,
-    net_ref: Option<(u64, u32)>,
     fb_dirty: bool,
 }
 
@@ -179,18 +179,15 @@ impl<S> Node<S> {
         &self.history
     }
 
-    /// Wasm runtime status.
+    /// Payload status.
     pub fn wasm_status(&self) -> badge_proto::WasmStatus {
         self.app.status()
     }
 
-    /// Network time estimate at local time `local` (local time before the
-    /// first own sync beacon).
-    fn network_ms(&self, local: u64) -> i64 {
-        match self.net_ref {
-            Some((at, net)) => i64::from(net.wrapping_add(u32::try_from(local.saturating_sub(at)).unwrap_or(0))),
-            None => i64::try_from(local).unwrap_or(i64::MAX),
-        }
+    /// The payload store and runtime.
+    #[cfg(test)]
+    pub fn app(&self) -> &AppSlot {
+        &self.app
     }
 }
 
@@ -206,7 +203,23 @@ pub struct World<N: Network> {
     net: N,
     nodes: Vec<Node<N::Sub>>,
     now: u64,
-    app_keys: BTreeSet<String>,
+    #[cfg(test)]
+    module: SimModule,
+}
+
+/// The bus filters every badge subscribes to: sync beacons, stock adverts
+/// and every app key.
+fn badge_filters() -> [KeyFilter<'static>; 3] {
+    [KeyFilter::Exact(keys::SYNC), KeyFilter::Exact(keys::OZ), KeyFilter::Prefix(APP)]
+}
+
+/// The prefix of the keys payloads exchange between badges.
+const APP: Key<'static> = Key::from_static("app");
+
+/// `local` milliseconds as the payload's wrapping `now_ms`.
+fn payload_ms(local: u64) -> u32 {
+    // Wrapping, like the firmware's millisecond uptime.
+    (local & u64::from(u32::MAX)) as u32
 }
 
 fn net_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> SimError {
@@ -215,15 +228,15 @@ fn net_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> SimError {
 
 impl<N: Network> World<N> {
     /// Builds the world: one guest per badge, each subscribed to the sync
-    /// and OZ keys and to `cfg.app_keys`. Nothing is booted before the first
-    /// [`World::step`].
+    /// and OZ keys and to the `app` prefix. Nothing is booted before the
+    /// first [`World::step`].
     pub fn new(module: &SimModule, cfg: WorldConfig, mut net: N) -> Result<Self, SimError> {
         let mut nodes = Vec::with_capacity(cfg.badges);
         for i in 0..cfg.badges {
             let guest = module.instantiate().map_err(|source| SimError::Guest { badge: i, source })?;
             let mut subs = Vec::new();
-            for key in [keys::SYNC.as_str(), keys::OZ.as_str()] {
-                subs.push((key.to_string(), net.subscribe(key).map_err(net_err)?));
+            for filter in badge_filters() {
+                subs.push(net.subscribe(filter).map_err(net_err)?);
             }
             let index = u64::try_from(i).unwrap_or(u64::MAX);
             nodes.push(Node {
@@ -235,20 +248,23 @@ impl<N: Network> World<N> {
                 next_adv: 0,
                 subs,
                 app: AppSlot::new(),
+                buttons: 0,
                 link: false,
                 up: Vec::new(),
                 down: frame::Decoder::new(),
                 history: Vec::new(),
                 leds: None,
-                net_ref: None,
                 fb_dirty: false,
             });
         }
-        let mut world = Self { cfg, net, nodes, now: 0, app_keys: BTreeSet::new() };
-        for key in world.cfg.app_keys.clone() {
-            world.ensure_app_key(&key)?;
-        }
-        Ok(world)
+        Ok(Self {
+            cfg,
+            net,
+            nodes,
+            now: 0,
+            #[cfg(test)]
+            module: module.clone(),
+        })
     }
 
     /// Virtual time of the next step.
@@ -283,30 +299,38 @@ impl<N: Network> World<N> {
         f(&mut node.guest).map_err(|source| SimError::Guest { badge: i, source })
     }
 
-    /// Subscribes every badge to app key `key` (once).
-    fn ensure_app_key(&mut self, key: &str) -> Result<(), SimError> {
-        if !self.app_keys.insert(key.to_string()) {
-            return Ok(());
-        }
-        for node in &mut self.nodes {
-            let sub = self.net.subscribe(key).map_err(net_err)?;
-            node.subs.push((key.to_string(), sub));
-        }
-        Ok(())
-    }
-
-    /// Subscribes the bus to every key badge `i`'s app subscribed to.
-    fn follow_app_subscriptions(&mut self, i: usize) -> Result<(), SimError> {
-        for key in self.node(i)?.app.subscriptions() {
-            self.ensure_app_key(&key)?;
-        }
-        Ok(())
-    }
-
-    /// App keys the bus is subscribed to.
+    /// Sets the button levels badge `i` reports from its next tick on (bit
+    /// n = `Button(n)` held).
     #[cfg(test)]
-    pub fn subscribed_app_keys(&self) -> impl Iterator<Item = &str> {
-        self.app_keys.iter().map(String::as_str)
+    pub fn set_buttons(&mut self, i: usize, levels: u8) -> Result<(), SimError> {
+        self.node_mut(i)?.buttons = levels;
+        Ok(())
+    }
+
+    /// Reboots badge `i` at the next step: a fresh core (new guest, as
+    /// after a reset) and a stopped payload; the payload store is kept, so
+    /// an installed payload autostarts at boot.
+    #[cfg(test)]
+    pub fn reboot(&mut self, i: usize) -> Result<(), SimError> {
+        let guest = self.module.instantiate().map_err(|source| SimError::Guest { badge: i, source })?;
+        let now = self.now;
+        let node = self.node_mut(i)?;
+        node.guest = guest;
+        node.boot_at = now;
+        node.booted = false;
+        node.advert = None;
+        node.leds = None;
+        node.buttons = 0;
+        node.down = frame::Decoder::new();
+        node.app.power_cycle();
+        Ok(())
+    }
+
+    /// Publishes `payload` on `key` from outside every badge (origin 0), as
+    /// another device on the bus would.
+    #[cfg(test)]
+    pub fn publish_external(&mut self, key: &str, payload: &[u8]) -> Result<(), SimError> {
+        self.net.publish(key, &envelope(0, payload)).map_err(net_err)
     }
 
     /// Advances one tick.
@@ -320,17 +344,17 @@ impl<N: Network> World<N> {
                 let mac = node.mac;
                 let out = self.guest_call(i, |g| g.init(mac))?;
                 self.route(i, out)?;
+                let actions = self.node_mut(i)?.app.autostart(0);
+                self.actions(i, actions)?;
             }
             if !self.node(i)?.booted {
                 continue;
             }
             let local = self.local(i)?;
-            let out = self.guest_call(i, |g| g.tick(local, 0))?;
+            let buttons = self.node(i)?.buttons;
+            let out = self.guest_call(i, |g| g.tick(local, buttons))?;
             self.route(i, out)?;
-            let node = self.node_mut(i)?;
-            let net_now = node.network_ms(local);
-            let actions = node.app.tick(net_now);
-            self.follow_app_subscriptions(i)?;
+            let actions = self.node_mut(i)?.app.tick(payload_ms(local));
             self.actions(i, actions)?;
             let interval = self.cfg.adv_interval_ms.max(1);
             let node = self.node_mut(i)?;
@@ -364,7 +388,7 @@ impl<N: Network> World<N> {
         for s in 0..subs {
             for _ in 0..DRAIN_MAX {
                 let Some(node) = self.nodes.get_mut(i) else { break };
-                let Some((_, sub)) = node.subs.get_mut(s) else { break };
+                let Some(sub) = node.subs.get_mut(s) else { break };
                 let Some((key, payload)) = self.net.try_recv(sub).map_err(net_err)? else { break };
                 self.receive(i, &key, &payload)?;
             }
@@ -390,8 +414,9 @@ impl<N: Network> World<N> {
             let out = self.guest_call(i, |g| g.sync(b.id, b.network_ms, rx_at))?;
             self.route(i, out)
         } else {
-            self.node_mut(i)?.app.deliver(key, body);
-            Ok(())
+            let now = payload_ms(self.local(i)?);
+            let actions = self.node_mut(i)?.app.deliver(key, body, now);
+            self.actions(i, actions)
         }
     }
 
@@ -407,23 +432,21 @@ impl<N: Network> World<N> {
             for record in Records::new(&bytes) {
                 let record = record.map_err(|error| SimError::Wire { badge: i, error })?;
                 match record {
-                    Record::Send(pb) => self.sent(i, pb)?,
+                    Record::Send(pb) => {
+                        let actions = self.sent(i, pb)?;
+                        work.extend(self.action_calls(i, actions)?);
+                    }
                     Record::Beacon(ad) => self.node_mut(i)?.advert = Some(ad.to_vec()),
                     Record::Sync { id, network_ms } => {
-                        let local = self.local(i)?;
-                        let node = self.node_mut(i)?;
-                        node.net_ref = Some((local, network_ms));
+                        let node = self.node(i)?;
                         let payload = envelope(node.mac, &SyncBeacon { id, network_ms }.encode());
                         self.net.publish(keys::SYNC.as_str(), &payload).map_err(net_err)?;
                     }
                     Record::Leds(c) => self.node_mut(i)?.leds = Some(c),
                     Record::Screen(_) => self.node_mut(i)?.fb_dirty = true,
                     Record::Wasm { seq, cmd } => {
-                        let local = self.local(i)?;
-                        let node = self.node_mut(i)?;
-                        let net_now = node.network_ms(local);
-                        let (answer, actions) = node.app.command(cmd, net_now);
-                        self.follow_app_subscriptions(i)?;
+                        let now = payload_ms(self.local(i)?);
+                        let (answer, actions) = self.node_mut(i)?.app.command(cmd, now);
                         let mut pb = [0u8; 256];
                         let answer = match &answer {
                             Ok(st) => badge_proto::encode(st, &mut pb)
@@ -461,7 +484,6 @@ impl<N: Network> World<N> {
             match action {
                 AppAction::Log(line) => outs.push(self.guest_call(i, |g| g.wasm_log(&line))?),
                 AppAction::Publish(key, payload) => {
-                    self.ensure_app_key(&key)?;
                     let payload = envelope(self.node(i)?.mac, &payload);
                     self.net.publish(&key, &payload).map_err(net_err)?;
                 }
@@ -474,11 +496,18 @@ impl<N: Network> World<N> {
         Ok(outs)
     }
 
-    /// A `Send` record of badge `i`.
-    fn sent(&mut self, i: usize, pb: &[u8]) -> Result<(), SimError> {
+    /// A `Send` record of badge `i`; a button edge also goes to the
+    /// payload, whose actions are returned.
+    fn sent(&mut self, i: usize, pb: &[u8]) -> Result<Vec<AppAction>, SimError> {
         let now = self.now;
+        let local = payload_ms(self.local(i)?);
         let node = self.node_mut(i)?;
+        let mut actions = Vec::new();
         if let Some(kind) = badge_proto::decode::<BadgeMsg>(pb).ok().and_then(|m| m.kind) {
+            if let BadgeMsg_::Kind::Event(badge_proto::Event { kind: Some(Event_::Kind::Button(b)) }) = &kind {
+                let (key, sample) = keys::button_sample(b.button, b.pressed);
+                actions = node.app.deliver(key.as_str(), &sample, local);
+            }
             if node.history.len() >= HISTORY_MAX {
                 node.history.remove(0);
             }
@@ -491,7 +520,7 @@ impl<N: Network> World<N> {
                 node.up.extend_from_slice(framed.get(..n).unwrap_or(&[]));
             }
         }
-        Ok(())
+        Ok(actions)
     }
 
     /// Feeds one host message to badge `i` directly (no framing).

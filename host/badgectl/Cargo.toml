@@ -27,17 +27,21 @@ anyhow = "1.0.100"
 thiserror = "2.0.18"
 serde_json = "1.0.145"
 ctrlc = "3.4"
-# `badgectl sim`: the badge core as wasm32 (embedded by build.rs), the app
-# runtime and ABI shared with the firmware, and the middleware bus.
+# `badgectl sim`: the badge core as wasm32 (embedded by build.rs), the
+# payload runtime shared with the firmware (middleware's wasm-host, "mw"
+# ABI), and the middleware bus.
 badge-sim = { path = "../../crates/badge-sim" }
 badge-mw.workspace = true
-wasm-abi.workspace = true
-wasm-runtime.workspace = true
-# Same engine and version as wasm-runtime (one wasmi in the workspace); `std`
+wasm-host.workspace = true
+# Same engine and version as wasm-host (one wasmi in the workspace); `std`
 # for the host, no `wat` / `memory64` / `simd`.
 wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate"] }
 middleware = { workspace = true, features = ["std"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
+
+[dev-dependencies]
+# WAT stand-ins for payloads in the simulator tests.
+wat = "1"
 
 [features]
 # `badgectl sim --zenoh <endpoint>`: simulated badges in different processes

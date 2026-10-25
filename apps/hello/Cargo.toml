@@ -1,9 +1,10 @@
-# Demo wasm app for the Conagotchi badge (and `badgectl sim`).
+# Demo payload for the Conagotchi badge (and `badgectl sim`), written on
+# middleware's `mw-payload` SDK ("mw" ABI, run by `wasm-host`).
 #
 # Not a member of the host workspace: it only builds for
 # wasm32-unknown-unknown with the linker flags in `.cargo/config.toml`.
 # `scripts/build-apps.sh` builds it and copies the result to
-# `apps/hello.wasm` (the artifact the runtime tests load).
+# `apps/hello.wasm` (the artifact the simulator tests load).
 [workspace]
 
 [package]
@@ -12,14 +13,16 @@ edition = "2024"
 version = "0.1.0"
 publish = false
 license = "MIT OR Apache-2.0"
-description = "Conagotchi demo wasm app: LED dot, counter on app/hello, logs"
+description = "Conagotchi demo payload: LED dot, counter on app/hello, button and sample logs"
 
 [lib]
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-wasm-abi = { path = "../../crates/wasm-abi", features = ["guest"] }
+# Same middleware revision as the host workspace (Cargo.toml, `middleware`
+# and `wasm-host`).
+mw-payload = { git = "https://github.com/jvishnefske/middleware", rev = "6b1720e8b4b7ef6983f53bb84227bbf759b1489d", package = "mw-payload" }
 
 [profile.release]
 opt-level = "z"

@@ -3,12 +3,28 @@
 version = 4
 
 [[package]]
+name = "embedded-hal"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [
- "wasm-abi",
+ "mw-payload",
 ]
 
 [[package]]
-name = "wasm-abi"
+name = "middleware"
+version = "0.2.0"
+source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
+
+[[package]]
+name = "mw-payload"
 version = "0.1.0"
+source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
+dependencies = [
+ "embedded-hal",
+ "middleware",
+]

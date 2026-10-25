@@ -162,25 +162,39 @@ pub const WASM_LOG_LEN: usize = 64;
 /// Largest wasm upload chunk (matches `WasmLoad.data`).
 pub const WASM_CHUNK: usize = 192;
 
-/// A wasm runtime command, executed by the firmware's wasm task (or the
-/// simulator) and answered with [`Input::Wasm`].
-// `Load` carries the chunk inline (no heap to box into); commands travel in
+/// A payload command, executed by the firmware's wasm task (or the
+/// simulator) and answered with exactly one [`Input::Wasm`]. The upload
+/// commands are the effects of `middleware::loader::Loader`, already
+/// validated by the core (order, length, CRC).
+// `Write` carries the chunk inline (no heap to box into); commands travel in
 // fixed-capacity effect vectors, so the size is bounded and known.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum WasmCmd {
-    /// Store one upload chunk; `offset` 0 starts a new upload.
-    Load {
-        /// Byte offset of `data` in the module.
+    /// Stop any running payload and erase the payload partition for an
+    /// image of `len` bytes.
+    Erase {
+        /// Image length.
+        len: u32,
+    },
+    /// Write `data` at `offset` in the image.
+    Write {
+        /// Byte offset in the image.
         offset: u32,
-        /// Full module size.
-        total: u32,
         /// The chunk.
         data: Vec<u8, WASM_CHUNK>,
     },
-    /// Instantiate the loaded module and run `init`.
+    /// The image is complete and its CRC-32 verified by the core: record it
+    /// as installed (persisted; autostarts on boot).
+    Activate {
+        /// Image length.
+        len: u32,
+        /// Image CRC-32.
+        crc: u32,
+    },
+    /// Start the installed payload.
     Start,
-    /// Stop the running app (module stays loaded).
+    /// Stop the running payload (it stays installed).
     Stop,
     /// Report status only.
     Status,

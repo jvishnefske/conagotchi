@@ -5,17 +5,20 @@
 //!
 //! 1. RTT channels and the defmt logger ([`rtt::init`]);
 //! 2. clocks at maximum, the esp-alloc heap (reclaimed bootloader RAM plus
-//!    64 KiB for esp-radio, plus [`wasm::HEAP_BYTES`] for the wasm runtime;
-//!    one shared allocator) — apart from esp-radio only the wasm runtime
-//!    allocates;
+//!    64 KiB for esp-radio, plus [`wasm::HEAP_BYTES`] for the wasm payload
+//!    runtime; one shared allocator) — apart from esp-radio only the
+//!    payload runtime and its image buffer allocate;
 //! 3. the esp-rtos scheduler on TIMG0 / `FROM_CPU_INTR0`;
 //! 4. drivers: buttons, indicators, WS2812 chain, GC9A01 display and, in
 //!    `dev` builds only, the GPIO probe pins (each failure is logged and that
-//!    driver is left out);
+//!    driver is left out); the buttons are sampled once here, and BOOT held
+//!    at reset selects payload safe mode;
 //! 5. the radio task ([`radio::start`]), the flash storage task
-//!    ([`storage::start`]: stored contacts and radio key, first-boot import of
-//!    the stock key), the wasm app task ([`wasm::start`], no app loaded) and
-//!    the link UART tasks ([`link_uart::start`]);
+//!    ([`storage::start`]: sole owner of `FLASH`; stored contacts and radio
+//!    key, first-boot import of the stock key, the `payload` partition), the
+//!    wasm payload task ([`wasm::start`]: autostarts the installed payload
+//!    unless in safe mode, without delaying the boot) and the link UART
+//!    tasks ([`link_uart::start`]);
 //! 6. the core loop, with [`BoardInfo`] built from the eFuse base MAC and the
 //!    crate name and version.
 //!
@@ -86,7 +89,8 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
     // Wi-Fi/BLE coexistence needs more RAM than the reclaimed region alone.
     esp_alloc::heap_allocator!(size: 64 * 1024);
-    // Room for the wasm runtime (wasmi), see `wasm` (shared allocator).
+    // Room for the wasm payload runtime (wasm-host / wasmi), see `wasm`
+    // (shared allocator).
     esp_alloc::heap_allocator!(size: wasm::HEAP_BYTES);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -106,6 +110,9 @@ async fn main(spawner: Spawner) -> ! {
     );
     let indicators = Indicators::new(peripherals.GPIO2, peripherals.GPIO4);
     info!("buttons + indicators ready");
+    // BOOT held at reset: payload safe mode (the installed payload is not
+    // autostarted).
+    let boot_held = badge_mw::payload::held(buttons.sample(), badge_proto::Button::Boot);
 
     let leds = match Ws2812::new(peripherals.RMT, peripherals.GPIO45) {
         Ok(leds) => {
@@ -185,7 +192,7 @@ async fn main(spawner: Spawner) -> ! {
         Err(e) => warn!("storage start failed: {}", e),
     }
 
-    match wasm::start(&spawner) {
+    match wasm::start(&spawner, boot_held) {
         Ok(()) => info!("wasm task started"),
         Err(e) => warn!("wasm start failed: {}", e),
     }

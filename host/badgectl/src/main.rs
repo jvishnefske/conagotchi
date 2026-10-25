@@ -244,8 +244,9 @@ fn request_on<L: Link, C: Clock>(
     Ok(if format::is_error(&resp) { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
-/// `wasm load <file>`: every chunk in order (stopping at the first error
-/// response), a progress line on stderr, then the runtime status.
+/// `wasm load <file>`: `WasmBegin`, every `WasmChunk` in order (a progress
+/// line on stderr) and `WasmCommit`, stopping at the first error response;
+/// then the payload status.
 fn wasm_upload<L: Link, C: Clock>(
     cli: &Cli,
     conn: &mut Conn<L, C>,
@@ -253,12 +254,16 @@ fn wasm_upload<L: Link, C: Clock>(
     path: &Path,
     mut seq: u32,
 ) -> Result<ExitCode> {
+    use badge_proto::HostMsg_::Cmd;
     let module = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let chunks = request::wasm_chunks(&module)?;
+    let plan = request::wasm_plan(&module)?;
     let total = module.len();
-    for chunk in chunks {
-        let end = chunk.offset as usize + chunk.data.len();
-        let msg = badge_proto::HostMsg { seq, cmd: Some(badge_proto::HostMsg_::Cmd::WasmLoad(chunk)) };
+    for cmd in plan {
+        let progress = match &cmd {
+            Cmd::WasmChunk(c) => Some(c.offset as usize + c.data.len()),
+            _ => None,
+        };
+        let msg = badge_proto::HostMsg { seq, cmd: Some(cmd) };
         seq = request::next_seq(seq);
         let resp = match finish(conn.request(&msg, cli.timeout, printer))? {
             Ok(r) => r,
@@ -269,10 +274,12 @@ fn wasm_upload<L: Link, C: Clock>(
             print_response(cli, &resp);
             return Ok(ExitCode::from(1));
         }
-        eprint!("\rloading {}: {end}/{total} bytes", path.display());
+        if let Some(end) = progress {
+            eprint!("\rloading {}: {end}/{total} bytes", path.display());
+        }
     }
     eprintln!();
-    let status = badge_proto::HostMsg { seq, cmd: Some(badge_proto::HostMsg_::Cmd::GetWasm(badge_proto::GetWasm {})) };
+    let status = badge_proto::HostMsg { seq, cmd: Some(Cmd::GetWasm(badge_proto::GetWasm {})) };
     let resp = match finish(conn.request(&status, cli.timeout, printer))? {
         Ok(r) => r,
         Err(code) => return Ok(code),

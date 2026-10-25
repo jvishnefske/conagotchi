@@ -44,7 +44,7 @@ const BYTES: &[(&str, u32)] = &[
     (".badge.LobbyPeer.id", 6),
     (".badge.Lobby.peer", 6),
     (".badge.TradeEvent.peer", 6),
-    (".badge.WasmLoad.data", 192),
+    (".badge.WasmChunk.data", 192),
     (".badge.WasmStatus.error", 48),
     (".badge.WasmLog.text", 64),
 ];

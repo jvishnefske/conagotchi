@@ -1,15 +1,8 @@
-# The badge runtime caps linear memory at wasm_abi::MAX_MEMORY_BYTES (16 KiB),
-# so the app uses 1-byte pages (custom-page-sizes) with a fixed 8 KiB memory
-# and a 4 KiB shadow stack. Floats are rejected by the runtime; none are used.
+# Target and output directory for the demo payload. The linker flags (1-byte
+# pages, fixed 16 KiB memory, 4 KiB stack) and the path remapping that makes
+# the build reproducible are set by scripts/build-apps.sh, the one supported
+# way to build it.
 [build]
 target = "wasm32-unknown-unknown"
 # Under the (git-ignored) host workspace target directory.
 target-dir = "../../target/apps"
-
-[target.wasm32-unknown-unknown]
-rustflags = [
-  "-C", "link-arg=--page-size=1",
-  "-C", "link-arg=-zstack-size=4096",
-  "-C", "link-arg=--initial-memory=8192",
-  "-C", "link-arg=--max-memory=8192",
-]

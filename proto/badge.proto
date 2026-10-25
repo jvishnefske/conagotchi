@@ -76,12 +76,13 @@ enum TradeState {
 }
 
 // Lifecycle of the on-badge wasm app.
+// Values match middleware::loader::PayloadStatus.
 enum WasmState {
-  WASM_STATE_EMPTY = 0;    // no module loaded
-  WASM_STATE_LOADING = 1;  // WasmLoad chunks arriving
-  WASM_STATE_LOADED = 2;   // complete module, validated, not running
-  WASM_STATE_RUNNING = 3;  // init() ran; tick() is called every core tick
-  WASM_STATE_TRAPPED = 4;  // trapped or ran out of fuel; see WasmStatus.error
+  WASM_STATE_EMPTY = 0;    // no payload installed
+  WASM_STATE_STOPPED = 1;  // installed (persisted), not running
+  WASM_STATE_RUNNING = 2;  // init() ran; tick() runs on its requested period
+  WASM_STATE_TRAPPED = 3;  // trapped or ran out of fuel; see WasmStatus.error
+  WASM_STATE_LOADING = 4;  // WasmBegin..WasmCommit in progress
 }
 
 // How a lobby peer was heard.
@@ -216,17 +217,26 @@ message GetLobby {}
 // One chunk of a wasm module upload. offset 0 starts a new upload (stopping
 // any running app); chunks must arrive in order; the upload is complete when
 // offset + len(data) == total.
-message WasmLoad {
-  uint32 offset = 1;
-  bytes data = 2;   // up to 192 bytes
-  uint32 total = 3; // full module size, at most wasm_abi::MAX_MODULE
+// Payload upload, mirroring middleware's loader (sys/loader/begin|chunk|
+// commit): Begin erases the payload partition, Chunks must arrive in order,
+// Commit verifies length and CRC-32 and persists the payload, which then
+// autostarts on boot (unless BOOT is held).
+message WasmBegin {
+  uint32 len = 1;    // image length, at most the payload partition capacity
+  uint32 crc32 = 2;  // CRC-32 (IEEE) of the whole image
 }
 
-// Instantiates the loaded module, runs its `init` export, then calls `tick`
-// every core tick.
+message WasmChunk {
+  uint32 offset = 1;
+  bytes data = 2;    // up to 192 bytes
+}
+
+message WasmCommit {}
+
+// Starts the installed payload (middleware wasm-host, "mw" ABI).
 message WasmStart {}
 
-// Stops the app; the module stays loaded.
+// Stops the payload; it stays installed.
 message WasmStop {}
 
 message GetWasm {}
@@ -268,12 +278,15 @@ message HostMsg {
     GetBleMetrics get_ble_metrics = 26;
     GetSync get_sync = 27;
     GetLobby get_lobby = 28;
-    WasmLoad wasm_load = 29;
     WasmStart wasm_start = 30;
     WasmStop wasm_stop = 31;
     GetWasm get_wasm = 32;
     AdcRead adc_read = 33;
+    WasmBegin wasm_begin = 34;
+    WasmChunk wasm_chunk = 35;
+    WasmCommit wasm_commit = 36;
   }
+  reserved 29;  // WasmLoad, replaced by WasmBegin/Chunk/Commit
 }
 
 // -------------------------------------------------------------- responses ---
@@ -396,10 +409,11 @@ message Lobby {
 
 message WasmStatus {
   WasmState state = 1;
-  uint32 size = 2;       // bytes received / module size
-  uint64 fuel_used = 3;  // total fuel consumed since start
+  uint32 size = 2;       // installed image size, or bytes received while loading
+  reserved 3;            // was fuel_used
   uint32 ticks = 4;      // tick() calls since start
   string error = 5;      // trap or validation message, empty if none
+  uint32 capacity = 6;   // payload partition capacity in bytes
 }
 
 // Calibrated ADC1 reading at 11 dB attenuation (about 0..3100 mV).

@@ -5,14 +5,18 @@
 //! shared virtual clock and connects them through a middleware bus
 //! ([`bus::LocalBus`] in-process, or Zenoh with the `zenoh` feature,
 //! `zenoh_net`), so Chi trades and LED sync work between simulated badges
-//! exactly as between real ones. Each badge can run a wasm app through the
-//! shared `wasm-runtime` ([`apps`]). [`link::SimLink`] implements the RTT
+//! exactly as between real ones. Each badge can run a wasm payload on
+//! middleware's `wasm-host` ("mw" ABI), with a simulated payload partition
+//! that follows the same upload commands as the firmware's ([`apps`]).
+//! [`link::SimLink`] implements the RTT
 //! `Link`, so `badgectl --sim <n> <request>` uses the normal request path.
 //! [`script`] parses scenarios, [`png`] writes screens.
 //!
 //! This file is the imperative shell of `badgectl sim`: it reads the script
 //! and app files, picks the bus, runs the loop (optionally paced to wall
-//! time), prints messages and writes PNGs.
+//! time), prints messages and writes PNGs. `--app FILE.wasm` installs and
+//! starts the payload on every badge through the same requests as `badgectl
+//! wasm load` plus `wasm start` ([`app_msgs`]).
 
 pub mod apps;
 pub mod bus;
@@ -31,6 +35,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use badge_proto::{BadgeMsg_, GetWasm, HostMsg, HostMsg_::Cmd, WasmStart};
 
+use crate::request::RequestError;
+
 use crate::cli::{RequestCmd, SimArgs};
 use crate::{format, request};
 use bus::{LocalBus, Network};
@@ -44,7 +50,6 @@ pub fn world_config(args: &SimArgs) -> WorldConfig {
         mac_base: args.mac_base,
         stagger_ms: args.stagger_ms,
         rssi: args.rssi,
-        app_keys: args.app_keys.clone(),
         ..WorldConfig::default()
     }
 }
@@ -60,36 +65,41 @@ pub fn load_module(path: Option<&Path>) -> Result<SimModule> {
     }
 }
 
-/// The host messages for one request: one, or an upload (chunks, then
-/// `GetWasm`). Advances `seq`.
-pub fn host_msgs(req: &RequestCmd, seq: &mut u32) -> Result<Vec<HostMsg>> {
-    let mut next = || {
-        let s = *seq;
-        *seq = request::next_seq(s);
-        s
-    };
-    if let Some(path) = request::wasm_upload(req) {
-        let module = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut msgs: Vec<HostMsg> = request::wasm_chunks(&module)?
-            .into_iter()
-            .map(|c| HostMsg { seq: next(), cmd: Some(Cmd::WasmLoad(c)) })
-            .collect();
-        msgs.push(HostMsg { seq: next(), cmd: Some(Cmd::GetWasm(GetWasm {})) });
-        return Ok(msgs);
-    }
-    Ok(vec![request::host_msg(req, next())?])
+/// `cmds` as host messages with consecutive sequence numbers from `seq`
+/// (advanced past them).
+fn numbered(cmds: Vec<Cmd>, seq: &mut u32) -> Vec<HostMsg> {
+    cmds.into_iter()
+        .map(|cmd| {
+            let s = *seq;
+            *seq = request::next_seq(s);
+            HostMsg { seq: s, cmd: Some(cmd) }
+        })
+        .collect()
 }
 
-/// The upload of `module` followed by `WasmStart`.
-pub fn app_msgs(module: &[u8], seq: &mut u32) -> Result<Vec<HostMsg>> {
-    let mut msgs = Vec::new();
-    for c in request::wasm_chunks(module)? {
-        msgs.push(HostMsg { seq: *seq, cmd: Some(Cmd::WasmLoad(c)) });
-        *seq = request::next_seq(*seq);
+/// The upload of `module` (`WasmBegin`, `WasmChunk`s, `WasmCommit`;
+/// `request::wasm_plan`) followed by `then`.
+fn upload_then(module: &[u8], then: Cmd) -> Result<Vec<Cmd>, RequestError> {
+    let mut cmds = request::wasm_plan(module)?;
+    cmds.push(then);
+    Ok(cmds)
+}
+
+/// The host messages for one request: one, or an upload (`wasm load`:
+/// begin, chunks, commit, then `GetWasm`). Advances `seq`.
+pub fn host_msgs(req: &RequestCmd, seq: &mut u32) -> Result<Vec<HostMsg>> {
+    if let Some(path) = request::wasm_upload(req) {
+        let module = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        return Ok(numbered(upload_then(&module, Cmd::GetWasm(GetWasm {}))?, seq));
     }
-    msgs.push(HostMsg { seq: *seq, cmd: Some(Cmd::WasmStart(WasmStart {})) });
+    let msg = request::host_msg(req, *seq)?;
     *seq = request::next_seq(*seq);
-    Ok(msgs)
+    Ok(vec![msg])
+}
+
+/// The upload of `module` followed by `WasmStart` (`--app`).
+pub fn app_msgs(module: &[u8], seq: &mut u32) -> Result<Vec<HostMsg>> {
+    Ok(numbered(upload_then(module, Cmd::WasmStart(WasmStart {}))?, seq))
 }
 
 /// One printed line for a message of badge `badge` at time `t`.

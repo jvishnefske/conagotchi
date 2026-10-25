@@ -40,14 +40,19 @@
 //! queues them in the multiplexer: manufacturer data under company id
 //! `badge_mw::ble::MW_COMPANY_ID` (`0xFFFF`), `[short id][seq][payload]`,
 //! payloads up to 21 bytes. A payload too large or a full queue drops the
-//! message (counted). The key is also learned by the app-key table below.
+//! message (counted). The key is also learned by the app subscriber below.
 //!
-//! Scan reports whose manufacturer data has that company id are decoded by
-//! a `badge_mw::ble::appkeys::AppKeyTable`, which maps the short id back to
-//! an `app/...` key text it knows (preloaded `KNOWN_APP_KEYS`, plus every
-//! key the app has published on) and drops repeats per sender. A fresh
-//! sample on a key that passes `app_may_use` goes to [`mw::APP_SAMPLES`]
-//! with `try_send` (dropped and counted when full).
+//! Every scan report that is not an OZ beacon is pushed into the
+//! `badge_mw::ble::advert::ScanQueue` of the middleware's
+//! `AdvertisingSubscriber` (built by `badge_mw::ble::advert::app_subscriber`:
+//! company id `0xFFFF`, filter `Prefix("app")`), which is then drained with
+//! `try_recv` inside the runner's callback. Its `ShortIdTable` maps the
+//! advert's short id back to an `app/...` key text it has learned (the
+//! preloaded `KNOWN_APP_KEYS`, plus every key the app has published on; a key
+//! whose short id collides with a learned one is refused and counted), and
+//! it drops repeats per (sender, key). A fresh sample on a key that passes
+//! `app_may_use` goes to [`mw::APP_SAMPLES`] with `try_send` (dropped and
+//! counted when full).
 //!
 //! # Scanning
 //!
@@ -91,18 +96,22 @@
 //! with its RPC characteristic (`4d579a3e-1c52-4b0f-0000-000000000001`,
 //! write, write without response, notify, values up to [`RPC_VALUE`] bytes).
 //! A write is copied, with the connection's ATT MTU, into a task-local
-//! channel; an RPC loop running beside the command loop reads it through
-//! `badge_mw::ble::rpc::RpcIo`, runs the middleware `BleTransport`'s
-//! `serve_one` with `badge_mw::ble::rpc::BadgeHandler` (answers from the
-//! PROBE block at the moment of the request) and queues each response
-//! fragment (at most `min(MTU, RPC_VALUE + 3) - 3` bytes) on a second
-//! channel, which the command loop sends as notifications to the connected
+//! channel, as are the central's connect and disconnect; an RPC loop running
+//! beside the command loop reads them through `badge_mw::ble::rpc::RpcIo`
+//! (lifecycle events reach the middleware as `Inbound::Connected` /
+//! `Disconnected`, which discard a partially received request), runs the
+//! middleware `BleServer`'s `serve_one` (fragment buffers of [`RPC_VALUE`]
+//! bytes) with `badge_mw::ble::rpc::BadgeHandler` (answers from the PROBE
+//! block at the moment of the request) and queues each response fragment
+//! (at most `min(MTU - 3, RPC_VALUE)` bytes) on a second channel, which the command loop sends as notifications to the connected
 //! central (only after it enabled them). Sets (`conagotchi/pet`,
 //! `conagotchi/pattern` with a one-byte payload) are drained from the
 //! handler's outbox into [`RADIO_EVENTS`] as `Input::Host` with `GATT_SEQ`,
 //! like the Conagotchi service's writes. A write arriving while the inbound
-//! channel is full is rejected (Insufficient Resources); fragments queued
-//! for notification while no central is connected are discarded.
+//! channel is full is rejected (Insufficient Resources), and a lifecycle
+//! event is dropped (the next request's first fragment still replaces a
+//! stale partial one); fragments queued for notification while no central is
+//! connected are discarded.
 //!
 //! If the host runner ever fails, the task keeps answering every BLE command
 //! with `ErrorCode::Radio` so each command still gets exactly one reply.
@@ -114,11 +123,13 @@ use badge_core::ble_metrics::BleMetrics;
 use badge_core::gatt::{self, GattError, Writable};
 use badge_core::io::{Input, MAX_ADV_DATA, MAX_BLE, Millis, Via};
 use badge_core::{oz, probe_layout};
-use badge_mw::ble::advert::{MuxAdvertiser, mw_template};
-use badge_mw::ble::appkeys::{AppKeyTable, carries_company};
-use badge_mw::ble::rpc::{self as mw_rpc, BadgeHandler, BadgeSnapshot, RpcIo, SnapshotSource};
-use badge_mw::ble::{AdvertisingPublisher, AttMtu, Key, MW_COMPANY_ID, Publisher, Responder};
+use badge_mw::ble::advert::{AppSubscriber, MuxAdvertiser, ScanQueue, app_subscriber, mw_template};
+use badge_mw::ble::rpc::{
+    self as mw_rpc, BadgeHandler, BadgeSnapshot, RpcEvent, RpcIo, RpcServer, SnapshotSource,
+};
+use badge_mw::ble::{APP_KEY_LEN, AdvertisingPublisher, AttMtu, MAX_ADVERT_PAYLOAD};
 use badge_mw::keys::app_may_use;
+use badge_mw::{Key, Publisher, Responder, Subscriber};
 use badge_proto::{BleDevice, ErrorCode};
 use defmt::{Debug2Format, info, warn};
 use embassy_futures::select::{Either, Either3, select, select3};
@@ -201,6 +212,10 @@ pub const RPC_VALUE: usize = 64;
 const RPC_RX_DEPTH: usize = 4;
 /// RPC response fragments buffered from the RPC loop to the central.
 const RPC_TX_DEPTH: usize = 2;
+/// Scan reports the app subscriber queues (drained after every push).
+const APP_SCAN_QUEUE: usize = 2;
+/// Room for one app sample: its key text plus an advert payload.
+const APP_SAMPLE_BUF: usize = APP_KEY_LEN + MAX_ADVERT_PAYLOAD;
 
 const _: () = assert!(badge_mw::ble::APP_KEY_LEN == mw::KEY_LEN);
 const _: () = assert!(badge_mw::ble::MAX_ADVERT_PAYLOAD <= mw::PAYLOAD_LEN);
@@ -211,14 +226,18 @@ type Gatt<'a, 's> = GattConnection<'a, 's, DefaultPacketPool>;
 /// The middleware advertising publisher over the multiplexer.
 type MwPublisher = AdvertisingPublisher<'static, MuxAdvertiser>;
 
-/// One RPC characteristic write: the value and the connection's ATT MTU.
-struct RpcFrame {
-    mtu: u16,
-    data: Vec<u8, RPC_VALUE>,
+/// One RPC characteristic event, from the command loop to the RPC loop.
+enum RpcIn {
+    /// A write: the value and the connection's ATT MTU.
+    Write { mtu: u16, data: Vec<u8, RPC_VALUE> },
+    /// A central connected.
+    Connected,
+    /// The central disconnected.
+    Disconnected,
 }
 
-/// Writes from the central to the RPC loop.
-type RpcRx = Channel<NoopRawMutex, RpcFrame, RPC_RX_DEPTH>;
+/// Writes and lifecycle events from the central to the RPC loop.
+type RpcRx = Channel<NoopRawMutex, RpcIn, RPC_RX_DEPTH>;
 /// Response fragments from the RPC loop to the central.
 type RpcTx = Channel<NoopRawMutex, Vec<u8, RPC_VALUE>, RPC_TX_DEPTH>;
 
@@ -270,11 +289,14 @@ struct Collector {
     /// `RadioPacket`s forwarded / dropped because [`RADIO_EVENTS`] was full.
     forwarded: Cell<u32>,
     dropped: Cell<u32>,
-    /// App keys whose middleware adverts are delivered to the app.
-    app_keys: RefCell<AppKeyTable>,
-    /// App samples delivered to / dropped because [`mw::APP_SAMPLES`] was full.
+    /// The middleware subscriber for app keys (over a scan report queue).
+    app_sub: RefCell<AppSubscriber<APP_SCAN_QUEUE>>,
+    /// App samples delivered to / dropped because [`mw::APP_SAMPLES`] was full
+    /// or the subscriber failed.
     app_rx: Cell<u32>,
     app_dropped: Cell<u32>,
+    /// App keys not learned (table full or short id collision).
+    app_unlearned: Cell<u32>,
 }
 
 impl Collector {
@@ -286,55 +308,78 @@ impl Collector {
             scanning: Cell::new(false),
             forwarded: Cell::new(0),
             dropped: Cell::new(0),
-            app_keys: RefCell::new(AppKeyTable::new()),
+            app_sub: RefCell::new(AppSubscriber::new(ScanQueue::new())),
             app_rx: Cell::new(0),
             app_dropped: Cell::new(0),
+            app_unlearned: Cell::new(0),
         }
     }
 
-    /// Preloads the known app keys (not `const`, so not done in `new`).
+    /// Installs the app subscriber preset (app filter, known keys); not
+    /// `const`, so not done in `new`.
     fn load_known_keys(&self) {
-        if let Ok(mut keys) = self.app_keys.try_borrow_mut() {
-            *keys = AppKeyTable::with_known();
+        match app_subscriber() {
+            Ok(sub) => {
+                if let Ok(mut slot) = self.app_sub.try_borrow_mut() {
+                    *slot = sub;
+                }
+            }
+            Err(e) => warn!("ble: app subscriber preset refused: {}", Debug2Format(&e)),
         }
     }
 
-    /// Lets adverts on `key` reach the app (a full table keeps its keys).
-    fn learn_key(&self, key: &str) {
-        if let Ok(mut keys) = self.app_keys.try_borrow_mut()
-            && let Ok(next) = keys.clone().learn(key)
-        {
-            *keys = next;
+    /// Lets adverts on `key` reach the app. A full table or a short id
+    /// collision keeps the learned keys (counted).
+    fn learn_key(&self, key: Key<'_>) {
+        let learned = self
+            .app_sub
+            .try_borrow_mut()
+            .is_ok_and(|mut sub| sub.learn(key).is_ok());
+        if !learned {
+            self.app_unlearned
+                .set(self.app_unlearned.get().wrapping_add(1));
         }
     }
 
-    /// Delivers a middleware advert on a known app key to the app.
+    /// Feeds a non-OZ advert to the app subscriber and delivers the fresh
+    /// samples on app keys to the app.
     fn app_advert(&self, report: &AdvReport<'_>) {
-        if !carries_company(report.data, MW_COMPANY_ID) {
+        let Ok(mut sub) = self.app_sub.try_borrow_mut() else {
             return;
+        };
+        let queue = core::mem::take(sub.scanner_mut()).push(report.addr, report.rssi, report.data);
+        *sub.scanner_mut() = queue;
+        let mut buf = [0u8; APP_SAMPLE_BUF];
+        // Every `try_recv` consumes at least one queued report, so this
+        // drains the queue.
+        for _ in 0..=APP_SCAN_QUEUE {
+            let sample = match sub.try_recv(&mut buf) {
+                Ok(Some(sample)) => sample,
+                Ok(None) => break,
+                Err(_) => {
+                    self.app_dropped.set(self.app_dropped.get().wrapping_add(1));
+                    continue;
+                }
+            };
+            let key = sample.key.as_str();
+            if !app_may_use(key) {
+                continue;
+            }
+            let (Ok(key), Ok(payload)) = (String::try_from(key), Vec::from_slice(sample.payload))
+            else {
+                self.app_dropped.set(self.app_dropped.get().wrapping_add(1));
+                continue;
+            };
+            let counter = if mw::APP_SAMPLES
+                .try_send(mw::MwMessage { key, payload })
+                .is_ok()
+            {
+                &self.app_rx
+            } else {
+                &self.app_dropped
+            };
+            counter.set(counter.get().wrapping_add(1));
         }
-        let Ok(mut keys) = self.app_keys.try_borrow_mut() else {
-            return;
-        };
-        let (next, sample) = core::mem::take(&mut *keys).decode(report.addr, report.data);
-        *keys = next;
-        let Some(sample) = sample else { return };
-        let Some(key) = keys.key(sample.slot).filter(|k| app_may_use(k)) else {
-            return;
-        };
-        let (Ok(key), Ok(payload)) = (String::try_from(key), Vec::from_slice(sample.payload))
-        else {
-            return;
-        };
-        let counter = if mw::APP_SAMPLES
-            .try_send(mw::MwMessage { key, payload })
-            .is_ok()
-        {
-            &self.app_rx
-        } else {
-            &self.app_dropped
-        };
-        counter.set(counter.get().wrapping_add(1));
     }
 
     /// Clears the device table and opens a `BleScan`.
@@ -578,7 +623,7 @@ async fn serve(
                     None => core::future::pending().await,
                 }
             };
-            let deadline = s.publisher.advertiser_mut().mux().next_deadline();
+            let deadline = s.publisher.advertiser().mux().next_deadline();
             let mux_due = async {
                 match deadline {
                     Some(at) => Timer::at(Instant::from_millis(at.0)).await,
@@ -598,12 +643,14 @@ async fn serve(
         };
         match event {
             Wake::Cmd(cmd) => command(&mut s, &mut peripheral, collector, scanning, cmd).await,
-            Wake::Tick => housekeeping(&mut s, &mut peripheral, collector, server).await,
+            Wake::Tick => housekeeping(&mut s, &mut peripheral, collector, server, rpc_rx).await,
             Wake::Gatt(ev) => {
                 let mtu = s.conn.as_ref().map_or(23, |c| c.raw().att_mtu());
                 if gatt_event(stack, server, ev, rpc_rx, mtu).await {
                     info!("ble: central disconnected");
                     s.conn = None;
+                    // Dropped when full (see the module docs).
+                    let _ = rpc_rx.try_send(RpcIn::Disconnected);
                 } else {
                     s.last_activity = Instant::now();
                 }
@@ -632,11 +679,16 @@ async fn serve(
 async fn publish_app(s: &mut Session<'_, '_>, collector: &Collector, msg: &mw::MwMessage) {
     let key = msg.key.as_str();
     let queued = match Key::new(key) {
-        Ok(k) if app_may_use(key) => s.publisher.publish(k, &msg.payload).await.is_ok(),
+        Ok(k) if app_may_use(key) => {
+            let ok = s.publisher.publish(k, &msg.payload).await.is_ok();
+            if ok {
+                collector.learn_key(k);
+            }
+            ok
+        }
         _ => false,
     };
     if queued {
-        collector.learn_key(key);
         s.mw_sent = s.mw_sent.wrapping_add(1);
     } else {
         s.mw_dropped = s.mw_dropped.wrapping_add(1);
@@ -733,8 +785,15 @@ async fn housekeeping<'d, 's>(
     peripheral: &mut Peripheral<'d, BleController, DefaultPacketPool>,
     collector: &Collector,
     server: Option<&'s Server<'static>>,
+    rpc_rx: &RpcRx,
 ) {
     let now = Instant::now();
+    // Keys the payload subscribed to (bounded by the channel capacity).
+    while let Ok(key) = mw::APP_SUBSCRIBED.try_receive() {
+        if let Ok(key) = Key::new(&key) {
+            collector.learn_key(key);
+        }
+    }
     if s.conn.is_none()
         && let Some(conn) = peripheral.try_accept()
     {
@@ -743,6 +802,8 @@ async fn housekeeping<'d, 's>(
         match server.map(|srv| conn.with_attribute_server(srv)) {
             Some(Ok(gatt)) => {
                 info!("ble: central connected");
+                // Dropped when full (see the module docs).
+                let _ = rpc_rx.try_send(RpcIn::Connected);
                 s.conn = Some(gatt);
                 s.last_activity = now;
                 s.connected_at = now;
@@ -792,11 +853,12 @@ async fn housekeeping<'d, 's>(
             collector.dropped.get()
         );
         info!(
-            "ble: mw adverts queued {} dropped {}, app samples {} dropped {}",
+            "ble: mw adverts queued {} dropped {}, app samples {} dropped {}, keys unlearned {}",
             s.mw_sent,
             s.mw_dropped,
             collector.app_rx.get(),
-            collector.app_dropped.get()
+            collector.app_dropped.get(),
+            collector.app_unlearned.get()
         );
     }
     if s.adv.is_none()
@@ -907,7 +969,7 @@ async fn gatt_request(
             });
             match data {
                 None => write.reject(AttErrorCode::INVALID_ATTRIBUTE_VALUE_LENGTH),
-                Some(data) => match rpc_rx.try_send(RpcFrame { mtu, data }) {
+                Some(data) => match rpc_rx.try_send(RpcIn::Write { mtu, data }) {
                     Ok(()) => write.accept(),
                     Err(_) => write.reject(AttErrorCode::INSUFFICIENT_RESOURCES),
                 },
@@ -984,8 +1046,8 @@ enum RpcIoError {
 struct ChannelRpcIo<'a> {
     rx: &'a RpcRx,
     tx: &'a RpcTx,
-    /// MTU of the connection the last write came from, capped so a fragment
-    /// fits [`RPC_VALUE`].
+    /// MTU of the connection the last write came from (the `BleServer` caps
+    /// fragments at [`RPC_VALUE`] bytes).
     mtu: AttMtu,
 }
 
@@ -1002,23 +1064,28 @@ impl RpcIo for ChannelRpcIo<'_> {
         Ok(())
     }
 
-    async fn next_write<'b>(&mut self, buf: &'b mut [u8]) -> Result<&'b [u8], RpcIoError> {
-        let frame = self.rx.receive().await;
-        // RPC_VALUE + 3 lies in 23..=517, so the fallback is never used.
-        let capped = frame.mtu.min(RPC_MTU_CAP);
-        self.mtu = AttMtu::new(capped).unwrap_or(AttMtu::DEFAULT);
-        let out = buf.get_mut(..frame.data.len()).ok_or(RpcIoError::TooLong)?;
-        out.copy_from_slice(&frame.data);
-        Ok(out)
+    async fn next_event<'b>(&mut self, buf: &'b mut [u8]) -> Result<RpcEvent<'b>, RpcIoError> {
+        // Cancel-safe: an embassy channel `receive` pops only when ready.
+        match self.rx.receive().await {
+            RpcIn::Write { mtu, data } => {
+                // trouble reports a legal MTU; the fallback is never used.
+                self.mtu = AttMtu::new(mtu).unwrap_or(AttMtu::DEFAULT);
+                let out = buf.get_mut(..data.len()).ok_or(RpcIoError::TooLong)?;
+                out.copy_from_slice(&data);
+                Ok(RpcEvent::Write(out))
+            }
+            RpcIn::Connected => {
+                self.mtu = AttMtu::DEFAULT;
+                Ok(RpcEvent::Connected)
+            }
+            RpcIn::Disconnected => Ok(RpcEvent::Disconnected),
+        }
     }
 }
 
-/// Largest ATT MTU the RPC fragments are sized for.
-const RPC_MTU_CAP: u16 = RPC_VALUE as u16 + 3;
-
 /// Serves middleware RPC requests forever (see the module docs).
 async fn rpc_loop(rx: &RpcRx, tx: &RpcTx) {
-    let mut server = mw_rpc::rpc_server(ChannelRpcIo {
+    let mut server: RpcServer<ChannelRpcIo<'_>, RPC_VALUE> = mw_rpc::rpc_server(ChannelRpcIo {
         rx,
         tx,
         mtu: AttMtu::DEFAULT,

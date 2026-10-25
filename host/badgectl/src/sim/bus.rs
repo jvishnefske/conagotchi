@@ -2,38 +2,43 @@
 //!
 //! [`LocalBus`] is an in-process implementation of `middleware::Publisher`
 //! and `middleware::Subscriber`: one bounded FIFO per subscription, filled by
-//! every publish on exactly that key (middleware keys have no wildcards).
-//! It is pure and deterministic: a publish is visible to every existing
+//! every publish whose key its `KeyFilter` selects (an exact key, or a
+//! prefix such as `app`, which selects `app/...` segment by segment). It is
+//! pure and deterministic: a publish is visible to every existing matching
 //! subscription immediately, in publish order; a subscription made later
 //! sees only later samples; a full queue drops its oldest sample (counted).
 //!
-//! `Subscriber::recv` waits for the next sample. The simulator runs in
-//! discrete ticks and must only drain what is already there, so
-//! [`poll_now`] polls a future exactly once with a no-op waker: an empty
-//! subscription yields `None` instead of blocking. The Zenoh backend
-//! (`super::zenoh_net`) is drained the same way.
+//! The simulator runs in discrete ticks and must only drain what is already
+//! there, so it receives with `Subscriber::try_recv`, which never waits.
+//! `LocalBus::publish` is ready at once; [`poll_now`] polls it exactly once
+//! with a no-op waker.
 //!
-//! [`Network`] is the small surface the world needs (subscribe, publish,
-//! drain one) so it runs unchanged over [`LocalBus`] or Zenoh; it exists
-//! because the middleware has no trait for *creating* a subscription.
+//! [`Network`] is the small synchronous surface the world needs (subscribe
+//! to a filter, publish, take one already-received sample) so it runs
+//! unchanged over [`LocalBus`] or Zenoh (`super::zenoh_net`), whose
+//! middleware API (`Subscribe`, `Publisher`) is async.
 //!
-//! Samples carry no sender identity in the middleware, but a radio does not
-//! hear itself, so every payload starts with an 8-byte little-endian origin
-//! (the badge MAC): [`envelope`] / [`open_envelope`].
+//! Every payload starts with an 8-byte little-endian origin (the badge MAC):
+//! [`envelope`] / [`open_envelope`]. A radio does not hear itself, and
+//! several simulated badges share one bus (or one Zenoh session), so the
+//! transport's own sender identity (middleware 0.2 `SampleMeta::sender`,
+//! one per Zenoh session) cannot tell them apart.
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};
 
-use middleware::{Key, KeyError, Publisher, Sample, Subscriber, transport::sample_into};
+use middleware::{Key, KeyError, KeyFilter, Publisher, Sample, Subscriber, transport::sample_into};
 
 /// Samples a subscription holds before the oldest is dropped.
 pub const QUEUE_DEPTH: usize = 64;
 /// Bytes of the origin header in every simulator payload.
 pub const ORIGIN_LEN: usize = 8;
-/// Receive buffer size: the longest key plus the largest payload we send.
-pub const SAMPLE_BUF: usize = middleware::key::MAX_KEY_LEN + 256;
+/// Receive buffer size: the longest key, the origin and the largest payload
+/// (a payload message, `wasm_abi::MAX_MESSAGE`; adverts and sync beacons are
+/// smaller).
+pub const SAMPLE_BUF: usize = middleware::key::MAX_KEY_LEN + ORIGIN_LEN + middleware::wasm_abi::MAX_MESSAGE;
 
 /// Polls `fut` once; `None` if it is not ready.
 pub fn poll_now<F: Future>(fut: F) -> Option<F::Output> {
@@ -84,8 +89,20 @@ pub struct SubId(usize);
 
 #[derive(Debug, Clone)]
 struct Queue {
+    /// The filter's key (validated at subscribe).
     key: String,
-    samples: VecDeque<Vec<u8>>,
+    /// `KeyFilter::Prefix` rather than `Exact`.
+    prefix: bool,
+    samples: VecDeque<(String, Vec<u8>)>,
+}
+
+impl Queue {
+    /// True if this queue's filter selects `key`.
+    fn selects(&self, key: Key<'_>) -> bool {
+        let Ok(k) = Key::new(&self.key) else { return false };
+        let filter = if self.prefix { KeyFilter::Prefix(k) } else { KeyFilter::Exact(k) };
+        filter.matches(key)
+    }
 }
 
 /// The in-process bus.
@@ -101,9 +118,10 @@ impl LocalBus {
         Self::default()
     }
 
-    /// Subscribes to `key`.
-    pub fn subscribe(&mut self, key: Key<'_>) -> SubId {
-        self.queues.push(Queue { key: key.as_str().to_string(), samples: VecDeque::new() });
+    /// Subscribes to the keys `filter` selects.
+    pub fn subscribe(&mut self, filter: KeyFilter<'_>) -> SubId {
+        let prefix = matches!(filter, KeyFilter::Prefix(_));
+        self.queues.push(Queue { key: filter.key().as_str().to_string(), prefix, samples: VecDeque::new() });
         SubId(self.queues.len() - 1)
     }
 
@@ -141,12 +159,12 @@ impl Publisher for BusPublisher<'_> {
 
     async fn publish(&mut self, key: Key<'_>, payload: &[u8]) -> Result<(), BusError> {
         let mut dropped = 0;
-        for q in self.bus.queues.iter_mut().filter(|q| q.key == key.as_str()) {
+        for q in self.bus.queues.iter_mut().filter(|q| q.selects(key)) {
             if q.samples.len() >= QUEUE_DEPTH {
                 q.samples.pop_front();
                 dropped += 1;
             }
-            q.samples.push_back(payload.to_vec());
+            q.samples.push_back((key.as_str().to_string(), payload.to_vec()));
         }
         self.bus.dropped += dropped;
         Ok(())
@@ -154,7 +172,8 @@ impl Publisher for BusPublisher<'_> {
 }
 
 /// `middleware::Subscriber` for one [`LocalBus`] subscription. `recv` stays
-/// pending while the queue is empty (use [`poll_now`]).
+/// pending while the queue is empty; `try_recv` returns `None`. A buffer too
+/// small for the next sample keeps it queued.
 #[derive(Debug)]
 pub struct BusSubscriber<'a> {
     bus: &'a mut LocalBus,
@@ -165,18 +184,24 @@ impl Subscriber for BusSubscriber<'_> {
     type Error = BusError;
 
     async fn recv<'b>(&mut self, buf: &'b mut [u8]) -> Result<Sample<'b>, BusError> {
-        let q = self.bus.queues.get_mut(self.id.0).ok_or(BusError::UnknownSubscription(self.id.0))?;
-        let Some(payload) = q.samples.front() else {
+        let id = self.id;
+        let ready = self.bus.queues.get(id.0).is_some_and(|q| !q.samples.is_empty());
+        if !ready && self.bus.queues.get(id.0).is_some() {
             return std::future::pending().await;
-        };
-        let needed = q.key.len() + payload.len();
-        if needed > buf.len() {
-            return Err(BusError::BufferTooSmall { needed, capacity: buf.len() });
         }
-        let payload = q.samples.pop_front().unwrap_or_default();
-        let key = q.key.clone();
+        self.try_recv(buf)?.ok_or(BusError::UnknownSubscription(id.0))
+    }
+
+    fn try_recv<'b>(&mut self, buf: &'b mut [u8]) -> Result<Option<Sample<'b>>, BusError> {
+        let q = self.bus.queues.get_mut(self.id.0).ok_or(BusError::UnknownSubscription(self.id.0))?;
+        let Some((key, payload)) = q.samples.front() else { return Ok(None) };
+        let needed = key.len() + payload.len();
         let capacity = buf.len();
-        sample_into(buf, &key, &payload).ok_or(BusError::BufferTooSmall { needed, capacity })
+        if needed > capacity {
+            return Err(BusError::BufferTooSmall { needed, capacity });
+        }
+        let (key, payload) = q.samples.pop_front().unwrap_or_default();
+        sample_into(buf, &key, &payload).map(Some).ok_or(BusError::BufferTooSmall { needed, capacity })
     }
 }
 
@@ -186,8 +211,8 @@ pub trait Network {
     type Sub;
     /// Transport failure.
     type Error: std::error::Error + Send + Sync + 'static;
-    /// Subscribes to `key`.
-    fn subscribe(&mut self, key: &str) -> Result<Self::Sub, Self::Error>;
+    /// Subscribes to the keys `filter` selects.
+    fn subscribe(&mut self, filter: KeyFilter<'_>) -> Result<Self::Sub, Self::Error>;
     /// Publishes `payload` on `key`.
     fn publish(&mut self, key: &str, payload: &[u8]) -> Result<(), Self::Error>;
     /// The next sample already received on `sub`, if any: (key, payload).
@@ -203,8 +228,8 @@ impl Network for LocalBus {
     type Sub = SubId;
     type Error = BusError;
 
-    fn subscribe(&mut self, key: &str) -> Result<SubId, BusError> {
-        Ok(LocalBus::subscribe(self, Key::new(key).map_err(BusError::Key)?))
+    fn subscribe(&mut self, filter: KeyFilter<'_>) -> Result<SubId, BusError> {
+        Ok(LocalBus::subscribe(self, filter))
     }
 
     fn publish(&mut self, key: &str, payload: &[u8]) -> Result<(), BusError> {
@@ -214,8 +239,7 @@ impl Network for LocalBus {
 
     fn try_recv(&mut self, sub: &mut SubId) -> Result<Option<(String, Vec<u8>)>, BusError> {
         let mut buf = [0u8; SAMPLE_BUF];
-        let mut s = self.subscriber(*sub);
-        poll_now(s.recv(&mut buf)).transpose().map(|o| o.map(owned))
+        Ok(self.subscriber(*sub).try_recv(&mut buf)?.map(owned))
     }
 }
 
@@ -237,9 +261,9 @@ mod tests {
     #[test]
     fn fr39_bus_delivers_to_every_subscriber_of_the_exact_key_in_order() {
         let mut bus = LocalBus::new();
-        let a1 = bus.subscribe(A);
-        let a2 = bus.subscribe(A);
-        let b = bus.subscribe(B);
+        let a1 = bus.subscribe(KeyFilter::Exact(A));
+        let a2 = bus.subscribe(KeyFilter::Exact(A));
+        let b = bus.subscribe(KeyFilter::Exact(B));
         Network::publish(&mut bus, "app/a", b"1").unwrap();
         Network::publish(&mut bus, "app/a", b"2").unwrap();
         Network::publish(&mut bus, "app/b", b"x").unwrap();
@@ -251,10 +275,26 @@ mod tests {
     }
 
     #[test]
+    fn fr39_bus_prefix_filter_selects_keys_below_it() {
+        let mut bus = LocalBus::new();
+        let app = bus.subscribe(KeyFilter::Prefix(Key::from_static("app")));
+        for k in ["app/a", "app/x/y", "apple", "badge/leds", "app"] {
+            Network::publish(&mut bus, k, k.as_bytes()).unwrap();
+        }
+        let mut got = Vec::new();
+        let mut id = app;
+        while let Some((k, p)) = bus.try_recv(&mut id).unwrap() {
+            assert_eq!(k.as_bytes(), p.as_slice(), "the sample keeps its own key");
+            got.push(k);
+        }
+        assert_eq!(got, ["app/a", "app/x/y", "app"]);
+    }
+
+    #[test]
     fn fr39_bus_late_subscriber_sees_only_later_samples() {
         let mut bus = LocalBus::new();
         Network::publish(&mut bus, "app/a", b"early").unwrap();
-        let a = bus.subscribe(A);
+        let a = bus.subscribe(KeyFilter::Exact(A));
         Network::publish(&mut bus, "app/a", b"late").unwrap();
         assert_eq!(drain(&mut bus, a), [b"late".to_vec()]);
     }
@@ -262,9 +302,10 @@ mod tests {
     #[test]
     fn fr39_bus_recv_through_the_middleware_trait() {
         let mut bus = LocalBus::new();
-        let a = bus.subscribe(A);
+        let a = bus.subscribe(KeyFilter::Exact(A));
         let mut buf = [0u8; 16];
         assert!(poll_now(bus.subscriber(a).recv(&mut buf)).is_none(), "pending when empty");
+        assert_eq!(bus.subscriber(a).try_recv(&mut buf), Ok(None));
         poll_now(bus.publisher().publish(A, b"hello")).unwrap().unwrap();
         let mut tiny = [0u8; 6];
         let err = poll_now(bus.subscriber(a).recv(&mut tiny)).unwrap();
@@ -281,7 +322,7 @@ mod tests {
     #[test]
     fn fr39_bus_full_queue_drops_oldest() {
         let mut bus = LocalBus::new();
-        let a = bus.subscribe(A);
+        let a = bus.subscribe(KeyFilter::Exact(A));
         for i in 0..QUEUE_DEPTH + 3 {
             Network::publish(&mut bus, "app/a", &[u8::try_from(i).unwrap()]).unwrap();
         }
@@ -294,7 +335,6 @@ mod tests {
     #[test]
     fn fr39_bus_rejects_invalid_keys_and_envelopes_round_trip() {
         let mut bus = LocalBus::new();
-        assert!(Network::subscribe(&mut bus, "a b").is_err());
         assert!(Network::publish(&mut bus, "a//b", b"").is_err());
         let e = envelope(0x0200_C0FF_EE01, b"body");
         assert_eq!(open_envelope(&e), Some((0x0200_C0FF_EE01, &b"body"[..])));

@@ -5,20 +5,27 @@
 //! multicast scouting and gossip disabled: the session only listens on and
 //! connects to the endpoints given (`--zenoh-listen`, `--zenoh`), so it
 //! never probes the network. Each badge declares its own subscriptions
-//! (Zenoh also delivers a session's puts to its own subscribers, which is
-//! why every payload carries its origin, see `super::bus`).
+//! (`middleware::Subscribe` with a `KeyFilter`; the `app` prefix becomes
+//! `app/**`).
+//!
+//! All badges of one world share the session. middleware 0.2 does not
+//! deliver a session's own puts by default, so the transport is opened with
+//! `with_local_delivery(true)`: the world's badges hear each other, and the
+//! origin every payload carries (see `super::bus`) lets a badge ignore its
+//! own samples. The 0.2 sender attachment (`SampleMeta::sender`) identifies
+//! the session, not the badge, so it cannot replace that origin.
 //!
 //! The middleware API is async; the world is a synchronous tick loop, so
 //! publishes and declarations run on a private Tokio runtime with
-//! `block_on`, and receiving polls `recv` once ([`super::bus::poll_now`]).
+//! `block_on`, and receiving uses `Subscriber::try_recv`, which never waits.
 //! Delivery across the network is asynchronous: a sample may arrive a tick
 //! or more after it was published, so runs over Zenoh are not
 //! deterministic.
 
 use middleware::zenoh::{SessionConfig, ZenohError, ZenohSubscriber, ZenohTransport};
-use middleware::{Key, KeyError, Publisher, Subscriber};
+use middleware::{Key, KeyError, KeyFilter, Publisher, Subscribe, Subscriber};
 
-use super::bus::{Network, SAMPLE_BUF, owned, poll_now};
+use super::bus::{Network, SAMPLE_BUF, owned};
 
 /// Zenoh bus failures.
 #[derive(Debug, thiserror::Error)]
@@ -42,12 +49,13 @@ pub struct ZenohNet {
 
 impl ZenohNet {
     /// Opens a session listening on `listen` and connecting to `connect`
-    /// (explicit endpoints only, e.g. `tcp/127.0.0.1:7447`).
+    /// (explicit endpoints only, e.g. `tcp/127.0.0.1:7447`), with local
+    /// delivery on.
     pub fn open(listen: &[String], connect: &[String]) -> Result<Self, ZenohNetError> {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
         let config = listen.iter().fold(SessionConfig::new(), |c, e| c.listen(e.clone()));
         let config = connect.iter().fold(config, |c, e| c.connect(e.clone())).build()?;
-        let transport = rt.block_on(ZenohTransport::open(config))?;
+        let transport = rt.block_on(ZenohTransport::open(config))?.with_local_delivery(true);
         Ok(Self { rt, transport })
     }
 }
@@ -56,9 +64,9 @@ impl Network for ZenohNet {
     type Sub = ZenohSubscriber;
     type Error = ZenohNetError;
 
-    fn subscribe(&mut self, key: &str) -> Result<ZenohSubscriber, ZenohNetError> {
-        let key = Key::new(key).map_err(ZenohNetError::Key)?;
-        Ok(self.rt.block_on(self.transport.subscriber(key))?)
+    fn subscribe(&mut self, filter: KeyFilter<'_>) -> Result<ZenohSubscriber, ZenohNetError> {
+        let Self { rt, transport } = self;
+        Ok(rt.block_on(transport.subscribe(filter))?)
     }
 
     fn publish(&mut self, key: &str, payload: &[u8]) -> Result<(), ZenohNetError> {
@@ -69,7 +77,7 @@ impl Network for ZenohNet {
 
     fn try_recv(&mut self, sub: &mut ZenohSubscriber) -> Result<Option<(String, Vec<u8>)>, ZenohNetError> {
         let mut buf = vec![0u8; SAMPLE_BUF];
-        Ok(poll_now(sub.recv(&mut buf)).transpose()?.map(owned))
+        Ok(sub.try_recv(&mut buf)?.map(owned))
     }
 }
 
@@ -102,7 +110,8 @@ mod tests {
     }
 
     /// One isolated session (no endpoints, no scouting): two badges in one
-    /// world hear each other through Zenoh's local delivery.
+    /// world hear each other through Zenoh's local delivery (switched on,
+    /// since middleware 0.2 turns it off by default).
     #[test]
     fn fr39_zenoh_isolated_session_carries_sync_between_badges() {
         let module = SimModule::new(None).unwrap();

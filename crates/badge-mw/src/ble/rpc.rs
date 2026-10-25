@@ -1,24 +1,29 @@
-//! The badge's middleware GATT RPC: a pure `Handler` and a `GattLink` over
+//! The badge's middleware GATT RPC: a pure `Handler` and a `GattServer` over
 //! the RPC characteristic.
 //!
 //! The firmware adds the middleware service [`SERVICE_UUID`]
 //! (`4d579a3e-1c52-4b0f-0000-000000000000`) with the one characteristic
 //! [`RPC_CHARACTERISTIC_UUID`] (`4d579a3e-1c52-4b0f-0000-000000000001`, write,
 //! write without response, notify) to its GATT server, and runs
-//! `Responder::serve_one` of a `BleTransport` built by [`rpc_server`] in a
-//! loop. Request and response framing is the middleware's (`frame`):
-//! fragments `[id][index][total u16 LE][data]`, request body
-//! `[key length][key][payload]`, response body `[status][payload]`.
+//! `Responder::serve_one` of the middleware `BleServer` built by
+//! [`rpc_server`] in a loop. Request and response framing is the
+//! middleware's (`frame`): fragments `[id][index][total u16 LE][data]`,
+//! request body `[key length][key][payload]`, response body
+//! `[status][payload]`.
 //!
 //! # Link
 //!
-//! [`RpcIo`] is the characteristic as the firmware sees it: the next value a
-//! central wrote, a notification to send, and the ATT MTU. [`RpcLink`] turns
-//! it into a middleware `GattLink` for the server role: every write becomes
-//! an `Inbound` of kind `Written` on the RPC characteristic, `notify` on the
-//! RPC characteristic notifies, and anything else (the client-role `write`,
-//! or a notify on another characteristic) is an [`RpcLinkError`]. Messages
-//! are reassembled into [`RPC_N`] (128) bytes.
+//! [`RpcIo`] is the characteristic as the firmware sees it: the next
+//! [`RpcEvent`] (a value a central wrote, or a central connecting or
+//! disconnecting), a notification to send, and the ATT MTU. [`RpcLink`]
+//! turns it into a middleware `GattServer`: a write becomes
+//! `Inbound::Value` on the RPC characteristic, the lifecycle events become
+//! `Inbound::Connected` / `Inbound::Disconnected` (so the server discards a
+//! partial request cut by a disconnect), `notify` on the RPC characteristic
+//! notifies, and a notify on any other characteristic is
+//! [`RpcLinkError::UnknownCharacteristic`]. Messages are reassembled into
+//! [`RPC_N`] (128) bytes; the fragment buffer size `A` is chosen by the
+//! caller of [`rpc_server`] (the firmware uses its characteristic size).
 //!
 //! # Handler
 //!
@@ -46,8 +51,7 @@
 use badge_core::gatt::{self, Writable};
 use badge_proto::HostMsg;
 use heapless::Deque;
-use middleware::ble::BleTransport;
-use middleware::ble::gatt::{AttMtu, GattLink, Inbound, InboundKind};
+use middleware::ble::gatt::{AttMtu, BleServer, GattServer, Inbound};
 use middleware::ble::uuid::{self, Uuid128};
 use middleware::{Handler, HandlerError, Key};
 
@@ -57,8 +61,9 @@ pub const INFO: Key<'static> = Key::from_static("conagotchi/info");
 pub const PET: Key<'static> = Key::from_static("conagotchi/pet");
 /// `conagotchi/pattern`: read or set the LED pattern.
 pub const PATTERN: Key<'static> = Key::from_static("conagotchi/pattern");
-/// The keys the badge's responder serves.
-pub static SERVICES: [Key<'static>; 3] = [INFO, PET, PATTERN];
+/// The keys the badge's responder serves (the handler answers `NotFound`
+/// for any other).
+pub const SERVICES: [Key<'static>; 3] = [INFO, PET, PATTERN];
 
 /// Reassembly size of RPC messages (request or response body).
 pub const RPC_N: usize = 128;
@@ -192,6 +197,17 @@ impl<S: SnapshotSource, const O: usize> Handler for BadgeHandler<S, O> {
     }
 }
 
+/// One event on the RPC characteristic; `Write` borrows the caller's buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcEvent<'b> {
+    /// A central wrote this value to the RPC characteristic.
+    Write(&'b [u8]),
+    /// A central connected.
+    Connected,
+    /// The central disconnected.
+    Disconnected,
+}
+
 /// The RPC characteristic as the firmware sees it.
 pub trait RpcIo {
     /// Binding-specific failure.
@@ -203,9 +219,9 @@ pub trait RpcIo {
     /// Notifies the connected central with `data` on the RPC characteristic.
     async fn notify(&mut self, data: &[u8]) -> Result<(), Self::Error>;
 
-    /// Waits for the next value a central wrote to the RPC characteristic and
-    /// copies it into `buf`.
-    async fn next_write<'b>(&mut self, buf: &'b mut [u8]) -> Result<&'b [u8], Self::Error>;
+    /// Waits for the next event, copying a written value into `buf`. Must be
+    /// cancel-safe: dropping the future before it is ready loses no event.
+    async fn next_event<'b>(&mut self, buf: &'b mut [u8]) -> Result<RpcEvent<'b>, Self::Error>;
 }
 
 /// Failure of [`RpcLink`].
@@ -213,13 +229,11 @@ pub trait RpcIo {
 pub enum RpcLinkError<E> {
     /// The I/O failed.
     Io(E),
-    /// The badge is only a GATT server: it never writes a peer.
-    ClientRole,
     /// A notification for a characteristic other than the RPC one.
     UnknownCharacteristic,
 }
 
-/// Server-role `GattLink` over an [`RpcIo`] (see the module docs).
+/// `GattServer` over an [`RpcIo`] (see the module docs).
 #[derive(Debug)]
 pub struct RpcLink<I> {
     io: I,
@@ -237,15 +251,11 @@ impl<I> RpcLink<I> {
     }
 }
 
-impl<I: RpcIo> GattLink for RpcLink<I> {
+impl<I: RpcIo> GattServer for RpcLink<I> {
     type Error = RpcLinkError<I::Error>;
 
     fn att_mtu(&self) -> AttMtu {
         self.io.att_mtu()
-    }
-
-    async fn write(&mut self, _uuid: Uuid128, _data: &[u8]) -> Result<(), Self::Error> {
-        Err(RpcLinkError::ClientRole)
     }
 
     async fn notify(&mut self, uuid: Uuid128, data: &[u8]) -> Result<(), Self::Error> {
@@ -256,18 +266,26 @@ impl<I: RpcIo> GattLink for RpcLink<I> {
     }
 
     async fn receive<'b>(&mut self, buf: &'b mut [u8]) -> Result<Inbound<'b>, Self::Error> {
-        let data = self.io.next_write(buf).await.map_err(RpcLinkError::Io)?;
-        Ok(Inbound {
-            kind: InboundKind::Written,
-            uuid: uuid::RPC_CHARACTERISTIC_UUID,
-            data,
-        })
+        Ok(
+            match self.io.next_event(buf).await.map_err(RpcLinkError::Io)? {
+                RpcEvent::Write(data) => Inbound::Value {
+                    uuid: uuid::RPC_CHARACTERISTIC_UUID,
+                    data,
+                },
+                RpcEvent::Connected => Inbound::Connected,
+                RpcEvent::Disconnected => Inbound::Disconnected,
+            },
+        )
     }
 }
 
-/// The badge's RPC responder over `io`, serving [`SERVICES`].
-pub fn rpc_server<I: RpcIo>(io: I) -> BleTransport<'static, RpcLink<I>, RPC_N> {
-    BleTransport::new(RpcLink::new(io)).with_services(&SERVICES)
+/// The badge's RPC responder over `io` with `A`-byte fragment buffers.
+pub type RpcServer<I, const A: usize> = BleServer<RpcLink<I>, RPC_N, A>;
+
+/// The badge's RPC responder over `io`; the [`BadgeHandler`] passed to
+/// `serve_one` decides which keys exist ([`SERVICES`]).
+pub const fn rpc_server<I: RpcIo, const A: usize>(io: I) -> RpcServer<I, A> {
+    BleServer::new(RpcLink::new(io))
 }
 
 #[cfg(test)]
@@ -281,12 +299,15 @@ mod tests {
     use core::cell::RefCell;
     use core::future::poll_fn;
     use core::task::Poll;
-    use middleware::ble::BleError;
     use middleware::ble::frame::{Fragmenter, Progress, Reassembler, parse_response};
+    use middleware::ble::gatt::{BleClient, BleError, GattClient};
     use middleware::{Requester, Responder};
     use std::collections::VecDeque;
     use std::rc::Rc;
     use std::vec::Vec;
+
+    /// Fragment buffer size of the badge's server in these tests.
+    const A: usize = 244;
 
     const SNAP: BadgeSnapshot = BadgeSnapshot {
         firmware: "fw 1",
@@ -296,27 +317,28 @@ mod tests {
         pattern: 2,
     };
 
+    /// What the central's link delivers to the badge.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ToBadge {
+        Write(Vec<u8>),
+        Connected,
+        Disconnected,
+    }
+
     /// Values in flight between the central and the badge.
     #[derive(Default)]
     struct Air {
-        to_badge: VecDeque<Vec<u8>>,
+        to_badge: VecDeque<ToBadge>,
         to_central: VecDeque<Vec<u8>>,
     }
 
     type Shared = Rc<RefCell<Air>>;
 
-    /// Pops from one direction, pending while it is empty.
-    async fn pop(air: &Shared, to_badge: bool) -> Vec<u8> {
-        poll_fn(|_| {
-            let mut a = air.borrow_mut();
-            let q = if to_badge {
-                &mut a.to_badge
-            } else {
-                &mut a.to_central
-            };
-            q.pop_front().map_or(Poll::Pending, Poll::Ready)
-        })
-        .await
+    /// Copies `v` into `buf`.
+    fn copy<'b>(buf: &'b mut [u8], v: &[u8]) -> Result<&'b [u8], ()> {
+        let out = buf.get_mut(..v.len()).ok_or(())?;
+        out.copy_from_slice(v);
+        Ok(out)
     }
 
     /// The badge side: the RPC characteristic.
@@ -335,58 +357,83 @@ mod tests {
             self.air.borrow_mut().to_central.push_back(data.to_vec());
             Ok(())
         }
-        async fn next_write<'b>(&mut self, buf: &'b mut [u8]) -> Result<&'b [u8], ()> {
-            let v = pop(&self.air, true).await;
-            let out = buf.get_mut(..v.len()).ok_or(())?;
-            out.copy_from_slice(&v);
-            Ok(out)
+        async fn next_event<'b>(&mut self, buf: &'b mut [u8]) -> Result<RpcEvent<'b>, ()> {
+            let ev = poll_fn(|_| {
+                self.air
+                    .borrow_mut()
+                    .to_badge
+                    .pop_front()
+                    .map_or(Poll::Pending, Poll::Ready)
+            })
+            .await;
+            Ok(match ev {
+                ToBadge::Write(v) => RpcEvent::Write(copy(buf, &v)?),
+                ToBadge::Connected => RpcEvent::Connected,
+                ToBadge::Disconnected => RpcEvent::Disconnected,
+            })
         }
     }
 
-    /// The central side: a middleware client-role GattLink.
+    /// The central side: a middleware `GattClient`.
     struct CentralLink {
         air: Shared,
         mtu: AttMtu,
     }
 
-    impl GattLink for CentralLink {
+    impl GattClient for CentralLink {
         type Error = ();
         fn att_mtu(&self) -> AttMtu {
             self.mtu
         }
         async fn write(&mut self, uuid: Uuid128, data: &[u8]) -> Result<(), ()> {
             assert_eq!(uuid, uuid::RPC_CHARACTERISTIC_UUID);
-            self.air.borrow_mut().to_badge.push_back(data.to_vec());
+            assert!(data.len() <= self.mtu.payload());
+            self.air
+                .borrow_mut()
+                .to_badge
+                .push_back(ToBadge::Write(data.to_vec()));
             Ok(())
         }
-        async fn notify(&mut self, _: Uuid128, _: &[u8]) -> Result<(), ()> {
-            Err(())
-        }
         async fn receive<'b>(&mut self, buf: &'b mut [u8]) -> Result<Inbound<'b>, ()> {
-            let v = pop(&self.air, false).await;
-            let out = buf.get_mut(..v.len()).ok_or(())?;
-            out.copy_from_slice(&v);
-            Ok(Inbound {
-                kind: InboundKind::Notified,
-                uuid: uuid::RPC_CHARACTERISTIC_UUID,
-                data: out,
+            let v = poll_fn(|_| {
+                self.air
+                    .borrow_mut()
+                    .to_central
+                    .pop_front()
+                    .map_or(Poll::Pending, Poll::Ready)
             })
+            .await;
+            Ok(Inbound::Value {
+                uuid: uuid::RPC_CHARACTERISTIC_UUID,
+                data: copy(buf, &v)?,
+            })
+        }
+        fn try_receive<'b>(&mut self, buf: &'b mut [u8]) -> Result<Option<Inbound<'b>>, ()> {
+            let Some(v) = self.air.borrow_mut().to_central.pop_front() else {
+                return Ok(None);
+            };
+            Ok(Some(Inbound::Value {
+                uuid: uuid::RPC_CHARACTERISTIC_UUID,
+                data: copy(buf, &v)?,
+            }))
         }
     }
 
-    fn pair(
-        mtu: u16,
-    ) -> (
-        BleTransport<'static, CentralLink, RPC_N>,
-        BleTransport<'static, RpcLink<BadgeIo>, RPC_N>,
-    ) {
+    type Central = BleClient<'static, CentralLink, RPC_N, A>;
+    type Badge = RpcServer<BadgeIo, A>;
+
+    fn pair(mtu: u16) -> (Central, Badge, Shared) {
         let air = Shared::default();
         let mtu = AttMtu::new(mtu).unwrap();
-        let central = BleTransport::new(CentralLink {
+        let central = BleClient::new(CentralLink {
             air: air.clone(),
             mtu,
         });
-        (central, rpc_server(BadgeIo { air, mtu }))
+        let badge = rpc_server(BadgeIo {
+            air: air.clone(),
+            mtu,
+        });
+        (central, badge, air)
     }
 
     /// One request from the middleware's own requester to the badge.
@@ -396,7 +443,7 @@ mod tests {
         key: Key<'_>,
         request: &[u8],
     ) -> Result<Vec<u8>, BleError<()>> {
-        let (mut central, mut badge) = pair(mtu);
+        let (mut central, mut badge, _) = pair(mtu);
         let mut resp = [0u8; RPC_N];
         let mut scratch = [0u8; RPC_SCRATCH];
         let (got, served) = join(
@@ -507,7 +554,7 @@ mod tests {
     }
 
     #[test]
-    fn fr38_rpc_link_is_server_role_only() {
+    fn fr38_rpc_link_maps_writes_and_lifecycle_to_inbound() {
         let air = Shared::default();
         let mut link = RpcLink::new(BadgeIo {
             air: air.clone(),
@@ -515,20 +562,56 @@ mod tests {
         });
         assert_eq!(link.att_mtu(), AttMtu::DEFAULT);
         assert_eq!(
-            block_on(link.write(uuid::RPC_CHARACTERISTIC_UUID, b"x")),
-            Err(RpcLinkError::ClientRole)
-        );
-        assert_eq!(
             block_on(link.notify(uuid::SERVICE_UUID, b"x")),
             Err(RpcLinkError::UnknownCharacteristic)
         );
         block_on(link.notify(uuid::RPC_CHARACTERISTIC_UUID, b"ok")).unwrap();
         assert_eq!(air.borrow_mut().to_central.pop_front().unwrap(), b"ok");
-        air.borrow_mut().to_badge.push_back(std::vec![1, 2]);
+        air.borrow_mut().to_badge.extend([
+            ToBadge::Connected,
+            ToBadge::Write(std::vec![1, 2]),
+            ToBadge::Disconnected,
+        ]);
         let mut buf = [0u8; 8];
-        let ev = block_on(link.receive(&mut buf)).unwrap();
-        assert_eq!((ev.kind, ev.data), (InboundKind::Written, &[1, 2][..]));
+        assert_eq!(block_on(link.receive(&mut buf)), Ok(Inbound::Connected));
+        assert_eq!(
+            block_on(link.receive(&mut buf)),
+            Ok(Inbound::Value {
+                uuid: uuid::RPC_CHARACTERISTIC_UUID,
+                data: &[1, 2]
+            })
+        );
+        assert_eq!(block_on(link.receive(&mut buf)), Ok(Inbound::Disconnected));
         assert!(link.io_mut().air.borrow().to_badge.is_empty());
+    }
+
+    /// A request cut by a disconnect is discarded; the next central's
+    /// request is answered.
+    #[test]
+    fn fr38_rpc_disconnect_discards_partial_request() {
+        let (mut central, mut badge, air) = pair(23);
+        let mut h: BadgeHandler<_> = BadgeHandler::new(SNAP);
+        let mut scratch = [0u8; RPC_SCRATCH];
+        // First fragment of a two-fragment request (id 9), then the link drops.
+        let f = Fragmenter::request(9, PET, &[0; 5], 20).unwrap();
+        assert_eq!(f.count(), 2);
+        let mut out = [0u8; 20];
+        let first = f.fragment(0, &mut out).unwrap().to_vec();
+        air.borrow_mut().to_badge.extend([
+            ToBadge::Connected,
+            ToBadge::Write(first),
+            ToBadge::Disconnected,
+            ToBadge::Connected,
+        ]);
+        let mut resp = [0u8; RPC_N];
+        let (got, served) = join(
+            central.request(INFO, b"", &mut resp),
+            badge.serve_one(&mut h, &mut scratch),
+        );
+        served.unwrap();
+        assert_eq!(got.unwrap(), b"fw 1;id=F60AC8;chi=HCK");
+        assert!(!badge.request_in_progress());
+        assert_eq!(h.pending(), 0);
     }
 
     /// The exact bytes a PC central writes for a `conagotchi/info` request
@@ -544,8 +627,8 @@ mod tests {
         assert_eq!(frag, expect);
 
         let air = Shared::default();
-        air.borrow_mut().to_badge.push_back(frag);
-        let mut badge = rpc_server(BadgeIo {
+        air.borrow_mut().to_badge.push_back(ToBadge::Write(frag));
+        let mut badge: Badge = rpc_server(BadgeIo {
             air: air.clone(),
             mtu: AttMtu::new(185).unwrap(),
         });

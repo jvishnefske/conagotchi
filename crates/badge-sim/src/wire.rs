@@ -14,8 +14,10 @@
 //!   - [`Tag::Indicator`] holds `Indicator` value `i32`, on `u8` (0 / 1);
 //!   - [`Tag::Screen`] holds one [`ScreenChange`] byte (the framebuffer was
 //!     already updated by the guest);
-//!   - [`Tag::Wasm`] holds request seq `u32`, command byte ([`WasmOp`]), then for
-//!     a load: offset `u32`, total `u32` and the chunk bytes;
+//!   - [`Tag::Wasm`] holds request seq `u32` and a command byte ([`WasmOp`]),
+//!     then per command: erase holds image length `u32`; write holds offset
+//!     `u32` and the chunk bytes; activate holds image length `u32` and
+//!     CRC-32 `u32`; start, stop and status hold nothing more;
 //!   - [`Tag::LinkSend`] holds one framed link-UART packet;
 //!   - [`Tag::SaveContact`] holds one protobuf-encoded `Contact`;
 //!   - [`Tag::ClearContacts`] is empty.
@@ -92,18 +94,22 @@ pub enum ScreenChange {
     Draw = 2,
 }
 
-/// Wasm command byte of a [`Tag::Wasm`] record.
+/// Payload command byte of a [`Tag::Wasm`] record (one per `WasmCmd`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum WasmOp {
-    /// Upload chunk.
-    Load = 0,
-    /// Start the app.
-    Start = 1,
-    /// Stop the app.
-    Stop = 2,
+    /// Erase the payload store for a new image.
+    Erase = 0,
+    /// Write one image chunk.
+    Write = 1,
+    /// Record the verified image as installed.
+    Activate = 2,
+    /// Start the installed payload.
+    Start = 3,
+    /// Stop the payload.
+    Stop = 4,
     /// Report status.
-    Status = 3,
+    Status = 5,
 }
 
 /// Why a record could not be written.
@@ -230,9 +236,15 @@ impl<const N: usize> OutBuf<N> {
             Effect::Wasm { seq, cmd } => {
                 let seq = seq.to_le_bytes();
                 match cmd {
-                    WasmCmd::Load { offset, total, data } => self.record(
+                    WasmCmd::Erase { len } => {
+                        self.record(Tag::Wasm, &[&seq, &[WasmOp::Erase as u8], &len.to_le_bytes()])
+                    }
+                    WasmCmd::Write { offset, data } => {
+                        self.record(Tag::Wasm, &[&seq, &[WasmOp::Write as u8], &offset.to_le_bytes(), data])
+                    }
+                    WasmCmd::Activate { len, crc } => self.record(
                         Tag::Wasm,
-                        &[&seq, &[WasmOp::Load as u8], &offset.to_le_bytes(), &total.to_le_bytes(), data],
+                        &[&seq, &[WasmOp::Activate as u8], &len.to_le_bytes(), &crc.to_le_bytes()],
                     ),
                     WasmCmd::Start => self.record(Tag::Wasm, &[&seq, &[WasmOp::Start as u8]]),
                     WasmCmd::Stop => self.record(Tag::Wasm, &[&seq, &[WasmOp::Stop as u8]]),
@@ -262,21 +274,32 @@ impl<const N: usize> OutBuf<N> {
     }
 }
 
-/// A wasm command decoded from a [`Tag::Wasm`] record.
+/// A payload command decoded from a [`Tag::Wasm`] record (mirrors
+/// `badge_core::io::WasmCmd`, borrowing the chunk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmRecord<'a> {
-    /// Upload chunk.
-    Load {
-        /// Offset of `data` in the module.
+    /// Stop any running payload and erase the store for `len` bytes.
+    Erase {
+        /// Image length.
+        len: u32,
+    },
+    /// Write `data` at `offset` in the image.
+    Write {
+        /// Byte offset in the image.
         offset: u32,
-        /// Module size.
-        total: u32,
         /// Chunk bytes.
         data: &'a [u8],
     },
-    /// Start the app.
+    /// The image is complete; record it as installed.
+    Activate {
+        /// Image length.
+        len: u32,
+        /// Image CRC-32, verified by the core.
+        crc: u32,
+    },
+    /// Start the installed payload.
     Start,
-    /// Stop the app.
+    /// Stop the payload.
     Stop,
     /// Report status.
     Status,
@@ -377,14 +400,18 @@ fn decode_body(tag: Tag, body: &[u8]) -> Option<Record<'_>> {
             let (seq, rest) = body.split_at_checked(4)?;
             let (&op, rest) = rest.split_first()?;
             let cmd = match (op, rest) {
-                (0, rest) => {
-                    let (offset, rest) = rest.split_at_checked(4)?;
-                    let (total, data) = rest.split_at_checked(4)?;
-                    WasmRecord::Load { offset: le_u32(offset)?, total: le_u32(total)?, data }
+                (0, len) => WasmRecord::Erase { len: le_u32(len)? },
+                (1, rest) => {
+                    let (offset, data) = rest.split_at_checked(4)?;
+                    WasmRecord::Write { offset: le_u32(offset)?, data }
                 }
-                (1, []) => WasmRecord::Start,
-                (2, []) => WasmRecord::Stop,
-                (3, []) => WasmRecord::Status,
+                (2, rest) => {
+                    let (len, crc) = rest.split_at_checked(4)?;
+                    WasmRecord::Activate { len: le_u32(len)?, crc: le_u32(crc)? }
+                }
+                (3, []) => WasmRecord::Start,
+                (4, []) => WasmRecord::Stop,
+                (5, []) => WasmRecord::Status,
                 _ => return None,
             };
             Record::Wasm { seq: le_u32(seq)?, cmd }
@@ -475,10 +502,9 @@ mod tests {
             Effect::SyncBroadcast { id: 0xC0FF_EE01, network_ms: 12345 },
             Effect::Leds(leds),
             Effect::Indicator(Indicator::Raffle, true),
-            Effect::Wasm {
-                seq: 4,
-                cmd: WasmCmd::Load { offset: 192, total: 400, data: heapless::Vec::from_slice(&[9; 5]).unwrap() },
-            },
+            Effect::Wasm { seq: 3, cmd: WasmCmd::Erase { len: 400 } },
+            Effect::Wasm { seq: 4, cmd: WasmCmd::Write { offset: 192, data: heapless::Vec::from_slice(&[9; 5]).unwrap() } },
+            Effect::Wasm { seq: 8, cmd: WasmCmd::Activate { len: 400, crc: 0xDEAD_BEEF } },
             Effect::Wasm { seq: 5, cmd: WasmCmd::Start },
             Effect::Wasm { seq: 6, cmd: WasmCmd::Stop },
             Effect::Wasm { seq: 7, cmd: WasmCmd::Status },
@@ -498,15 +524,17 @@ mod tests {
         assert_eq!(recs[2], Record::Sync { id: 0xC0FF_EE01, network_ms: 12345 });
         assert_eq!(recs[3], Record::Leds(leds));
         assert_eq!(recs[4], Record::Indicator { which: Indicator::Raffle, on: true });
-        assert_eq!(recs[5], Record::Wasm { seq: 4, cmd: WasmRecord::Load { offset: 192, total: 400, data: &[9; 5] } });
-        assert_eq!(recs[6], Record::Wasm { seq: 5, cmd: WasmRecord::Start });
-        assert_eq!(recs[7], Record::Wasm { seq: 6, cmd: WasmRecord::Stop });
-        assert_eq!(recs[8], Record::Wasm { seq: 7, cmd: WasmRecord::Status });
-        assert_eq!(recs[9], Record::LinkSend(&[0xAA, 0x55]));
-        let Record::SaveContact(pb) = recs[10] else { panic!("contact") };
+        assert_eq!(recs[5], Record::Wasm { seq: 3, cmd: WasmRecord::Erase { len: 400 } });
+        assert_eq!(recs[6], Record::Wasm { seq: 4, cmd: WasmRecord::Write { offset: 192, data: &[9; 5] } });
+        assert_eq!(recs[7], Record::Wasm { seq: 8, cmd: WasmRecord::Activate { len: 400, crc: 0xDEAD_BEEF } });
+        assert_eq!(recs[8], Record::Wasm { seq: 5, cmd: WasmRecord::Start });
+        assert_eq!(recs[9], Record::Wasm { seq: 6, cmd: WasmRecord::Stop });
+        assert_eq!(recs[10], Record::Wasm { seq: 7, cmd: WasmRecord::Status });
+        assert_eq!(recs[11], Record::LinkSend(&[0xAA, 0x55]));
+        let Record::SaveContact(pb) = recs[12] else { panic!("contact") };
         assert_eq!(badge_proto::decode::<badge_proto::Contact>(pb), Ok(contact.to_proto()));
-        assert_eq!(recs[11], Record::ClearContacts);
-        assert_eq!(recs[12], Record::Screen(ScreenChange::Animate));
+        assert_eq!(recs[13], Record::ClearContacts);
+        assert_eq!(recs[14], Record::Screen(ScreenChange::Animate));
     }
 
     #[test]
@@ -549,6 +577,10 @@ mod tests {
         assert_eq!(all(&[3, 1, 0, 0]), [Err(DecodeError::BadBody(Tag::Sync))]);
         assert_eq!(all(&[6, 1, 0, 7]), [Err(DecodeError::BadBody(Tag::Screen))]);
         assert_eq!(all(&[7, 5, 0, 1, 0, 0, 0, 9]), [Err(DecodeError::BadBody(Tag::Wasm))]);
+        // Erase with a short length, activate without its CRC, start with a body.
+        assert_eq!(all(&[7, 7, 0, 1, 0, 0, 0, 0, 1, 0]), [Err(DecodeError::BadBody(Tag::Wasm))]);
+        assert_eq!(all(&[7, 9, 0, 1, 0, 0, 0, 2, 1, 0, 0, 0]), [Err(DecodeError::BadBody(Tag::Wasm))]);
+        assert_eq!(all(&[7, 6, 0, 1, 0, 0, 0, 3, 0]), [Err(DecodeError::BadBody(Tag::Wasm))]);
         assert_eq!(all(&[5, 5, 0, 1, 0, 0, 0, 2]), [Err(DecodeError::BadBody(Tag::Indicator))]);
         assert_eq!(all(&[10, 1, 0, 0]), [Err(DecodeError::BadBody(Tag::ClearContacts))]);
         // A good record, then garbage: one Ok, one Err, then the end.

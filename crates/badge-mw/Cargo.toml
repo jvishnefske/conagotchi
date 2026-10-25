@@ -1,13 +1,13 @@
 [package]
 name = "badge-mw"
-description = "Conagotchi bindings of the middleware traits: ESP-NOW backend, BLE adapters, shared keys"
+description = "Conagotchi bindings of the middleware: badge keys, BLE advertising multiplexer and adapters, GATT RPC handler"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
 license.workspace = true
 
 [dependencies]
-middleware = { workspace = true, features = ["ble"] }
+middleware = { workspace = true, features = ["ble", "espnow"] }
 heapless.workspace = true
 # BLE adapters: OZ beacon data, GATT value formats and HostMsg for RPC sets.
 badge-core.workspace = true

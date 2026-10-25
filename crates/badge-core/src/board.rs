@@ -104,6 +104,21 @@ pub fn probe_allowed(pin: u32) -> bool {
     PROBE_PINS.iter().any(|g| u32::from(g.0) == pin)
 }
 
+/// Largest wasm payload image accepted for upload. The payload partition
+/// (0x1E0000, 128 KiB) could hold more, but the runtime loads the whole image
+/// into RAM, so the limit is set by the heap, not by flash.
+pub const PAYLOAD_MAX_IMAGE: u32 = 16 * 1024;
+
+/// Linear-memory cap of a running payload, in bytes (wasm-host
+/// `Limits::bytes`; payloads use 1-byte pages, see `scripts/build-apps.sh`).
+/// Shared by the firmware and `badgectl sim` so both run payloads alike.
+pub const PAYLOAD_MAX_MEMORY: u32 = 16 * 1024;
+
+/// Fuel granted to every call into a payload (`init`, `tick`, `on_message`,
+/// ...; wasm-host `Limits::with_fuel`). Shared by the firmware and
+/// `badgectl sim`.
+pub const PAYLOAD_FUEL_PER_CALL: u64 = 50_000;
+
 /// Probe pins that can be sampled with ADC1 (`AdcRead`, dev builds). ADC1 is
 /// GPIO1..=10 on the S3; ADC2 (GPIO11..=20) is shared with Wi-Fi, so probe
 /// pins 15..=18 are left out.

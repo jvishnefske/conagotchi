@@ -1,18 +1,26 @@
 # Conagotchi badge partition table (ESP-IDF CSV, 8 MB flash).
 #
-# Identical to the stock MicroPython table at 0x8000 except that the unused
-# otadata slot becomes `conag` (our contacts and imported radio key). With no
-# otadata partition the bootloader always boots `factory`. nvs, phy_init, vfs
-# (the stock littlefs files, including radio_key.txt) and doom keep their
-# exact stock entries, so stock data survives our firmware.
+# Identical to the stock MicroPython table at 0x8000 except that:
 #
-# conag uses data subtype `undefined` (0x06), ESP-IDF's subtype for
-# application data; espflash/probe-rs reject unknown numeric data subtypes.
+# - the unused otadata slot becomes `conag` (our contacts and imported radio
+#   key). With no otadata partition the bootloader always boots `factory`;
+# - `factory` is shortened from 0x1F0000 to 0x1D0000 (1,900,544 bytes; the
+#   build checks the app image against it) and the freed 128 KiB at
+#   0x1E0000 becomes `payload`: the installed wasm payload in middleware's
+#   esp-base layout (a header sector, then the image; see src/wasm.rs).
+#
+# nvs, phy_init, vfs (the stock littlefs files, including radio_key.txt) and
+# doom keep their exact stock entries, so stock data survives our firmware.
+#
+# conag and payload use data subtype `undefined` (0x06), ESP-IDF's subtype
+# for application data; espflash/probe-rs reject unknown numeric data
+# subtypes.
 #
 # Name,   Type, SubType,   Offset,   Size,     Flags
 nvs,      data, nvs,       0x9000,   0x6000,
 phy_init, data, phy,       0xf000,   0x1000,
-factory,  app,  factory,   0x10000,  0x1F0000,
+factory,  app,  factory,   0x10000,  0x1D0000,
+payload,  data, undefined, 0x1E0000, 0x20000,
 conag,    data, undefined, 0x200000, 0x2000,
 vfs,      data, fat,       0x202000, 0x55E000,
 doom,     app,  ota_0,     0x760000, 0xA0000,
