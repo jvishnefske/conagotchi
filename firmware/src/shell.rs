@@ -42,7 +42,7 @@
 //! answered with `UNSUPPORTED` (the core does not emit them in that build).
 
 use badge_core::app::{App, BoardInfo};
-use badge_core::io::{ButtonMask, Effect, Input, Millis};
+use badge_core::io::{ButtonMask, Effect, Effects, Input, Millis};
 use badge_core::ui;
 use badge_proto::ErrorCode;
 use defmt::{info, warn};
@@ -120,7 +120,11 @@ struct Shell {
 /// Runs the core loop forever.
 pub async fn run(hw: Hardware, info: BoardInfo) -> ! {
     let mut shell = Shell { hw, followups: Deque::new(), redraw_pending: false, animate_pending: false, stats: Stats::default() };
+    // The app and one effect buffer live in this task's state (static
+    // memory), and `App::step` updates both in place, so neither the 5 KB
+    // app nor the 10 KB effect vector is copied onto the stack per input.
     let mut app = App::new(info);
+    let mut effects = Effects::new();
     let mut ticker = Ticker::every(Duration::from_millis(TICK_MS));
     let mut last_buttons = ButtonMask::default();
     let mut next_heartbeat = HEARTBEAT_MS;
@@ -135,38 +139,38 @@ pub async fn run(hw: Hardware, info: BoardInfo) -> ! {
             info!("buttons raw {=u8:#07b}", buttons.0);
             last_buttons = buttons;
         }
-        app = shell.feed(app, Input::Tick { now, buttons });
+        shell.feed(&mut app, &mut effects, Input::Tick { now, buttons });
 
         for _ in 0..MAX_HOST_PER_TICK {
             match shell.hw.link.next_input() {
-                Some(input) => app = shell.feed(app, input),
+                Some(input) => shell.feed(&mut app, &mut effects, input),
                 None => break,
             }
         }
 
         for _ in 0..MAX_RADIO_PER_TICK {
             match RADIO_EVENTS.try_receive() {
-                Ok(input) => app = shell.feed(app, input),
+                Ok(input) => shell.feed(&mut app, &mut effects, input),
                 Err(_) => break,
             }
         }
 
         for _ in 0..MAX_WASM_PER_TICK {
             match wasm::try_next() {
-                Some(input) => app = shell.feed(app, input),
+                Some(input) => shell.feed(&mut app, &mut effects, input),
                 None => break,
             }
         }
 
         match probe::take_mailbox() {
             Mailbox::Empty => {}
-            Mailbox::Command(msg) => app = shell.feed(app, Input::Host(msg)),
+            Mailbox::Command(msg) => shell.feed(&mut app, &mut effects, Input::Host(msg)),
             Mailbox::Unknown(cmd) => warn!("PROBE mailbox: unknown command {}", cmd),
         }
 
         for _ in 0..MAX_FOLLOWUPS_PER_TICK {
             match shell.followups.pop_front() {
-                Some(input) => app = shell.feed(app, input),
+                Some(input) => shell.feed(&mut app, &mut effects, input),
                 None => break,
             }
         }
@@ -186,12 +190,14 @@ pub async fn run(hw: Hardware, info: BoardInfo) -> ! {
 
 impl Shell {
     /// Feeds one input to the app and executes the resulting effects.
-    fn feed(&mut self, app: App, input: Input) -> App {
-        let (next, effects) = app.handle(input);
-        for effect in effects {
-            self.execute(effect, &next);
+    fn feed(&mut self, app: &mut App, effects: &mut Effects, input: Input) {
+        app.step(input, effects);
+        // One effect at a time is cloned out of the buffer, in order.
+        for i in 0..effects.len() {
+            if let Some(effect) = effects.get(i).cloned() {
+                self.execute(effect, app);
+            }
         }
-        next
     }
 
     /// Carries out one effect.
@@ -202,6 +208,14 @@ impl Shell {
                     wasm::button(button, pressed);
                 }
                 if let Err(e) = self.hw.link.send(&msg) {
+                    self.stats.send_errors = self.stats.send_errors.wrapping_add(1);
+                    warn!("proto-up send failed: {}", e);
+                }
+            }
+            // Scan results are built from the next state here, so the large
+            // lists never travel inside an `Effect`.
+            Effect::SendScan { seq, kind } => {
+                if let Err(e) = self.hw.link.send(&app.scan_response(kind, seq)) {
                     self.stats.send_errors = self.stats.send_errors.wrapping_add(1);
                     warn!("proto-up send failed: {}", e);
                 }

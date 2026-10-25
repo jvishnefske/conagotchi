@@ -898,10 +898,11 @@ fn fr16_wifi_scan_busy_and_result() {
         seq: Some(1),
         result: Ok(aps.clone()),
     });
-    assert_eq!(
-        only_response(&fx, 1),
-        Body::WifiScan(WifiScanResult { aps: aps.clone() })
-    );
+    // The result travels as a small effect; the shell expands it.
+    assert_eq!(fx.as_slice(), &[Effect::SendScan { seq: 1, kind: crate::io::ScanKind::Wifi }]);
+    let msg = app.scan_response(crate::io::ScanKind::Wifi, 1);
+    let Some(BadgeMsg_::Kind::Response(r)) = msg.kind else { panic!("response") };
+    assert_eq!((r.seq, r.body), (1, Some(Body::WifiScan(WifiScanResult { aps: aps.clone() }))));
     assert_eq!(app.access_points(), aps.as_slice());
     assert_eq!(app.wifi_scan_state(), ScanState::Done);
     // Not busy any more; a failed scan keeps the old list.
@@ -991,12 +992,10 @@ fn fr18_ble_scan_duration_busy_and_result() {
         seq: Some(1),
         result: Ok(devices.clone()),
     });
-    assert_eq!(
-        only_response(&fx, 1),
-        Body::BleScan(BleScanResult {
-            devices: devices.clone()
-        })
-    );
+    assert!(fx.contains(&Effect::SendScan { seq: 1, kind: crate::io::ScanKind::Ble }));
+    let msg = app.scan_response(crate::io::ScanKind::Ble, 1);
+    let Some(BadgeMsg_::Kind::Response(r)) = msg.kind else { panic!("response") };
+    assert_eq!((r.seq, r.body), (1, Some(Body::BleScan(BleScanResult { devices: devices.clone() }))));
     assert_eq!(app.ble_devices(), devices.as_slice());
     assert!(!app.ble_scan_state().is_busy());
 }

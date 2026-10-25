@@ -88,6 +88,16 @@ impl TradeModel {
         }
     }
 
+    /// Runs one immutable `Session` transition in place: the session is
+    /// moved out (an idle placeholder fills the slot for the duration),
+    /// passed to `f`, and the returned session stored back.
+    fn step<R>(&mut self, f: impl FnOnce(Session) -> (Session, R)) -> R {
+        let idle = Session::new(self.session.me(), Chi::Vib);
+        let (session, r) = f(core::mem::replace(&mut self.session, idle));
+        self.session = session;
+        r
+    }
+
     /// Our badge id on air.
     pub fn me(&self) -> PeerId {
         self.session.me()
@@ -205,29 +215,26 @@ fn contact_pages(len: usize) -> usize {
 impl App {
     /// Lobby timers: beacons, expiry, trade timeouts. At most
     /// [`TRADE_TICK_EFFECTS`] effects.
-    pub(super) fn trade_tick(mut self, out: &mut Out) -> Self {
+    pub(super) fn trade_tick(&mut self, out: &mut Out) {
         let before = self.trade.view_key(self.signed());
         let now = self.now;
-        let (session, events) = self.trade.session.tick(now);
-        self.trade.session = session;
+        let events = self.trade.step(|s| s.tick(now));
         let mut used = 0;
         // A tick changes the state at most once (one timer fires).
         if let Some(&e) = events.last() {
             used += self.trade_event(e, out);
         }
         if self.trade.session.beacon_due(now) && used + 2 <= TRADE_TICK_EFFECTS {
-            let (session, packet) = self.trade.session.beacon(now);
-            self.trade.session = session;
-            self = self.send_beacon(&packet, out);
+            let packet = self.trade.step(|s| s.beacon(now));
+            self.send_beacon(&packet, out);
         }
         self.trade_redraw(before, out);
-        self
     }
 
     /// Signs `packet`, frames it for the link and updates the advert.
-    fn send_beacon(mut self, packet: &[u8], out: &mut Out) -> Self {
+    fn send_beacon(&mut self, packet: &[u8], out: &mut Out) {
         let Ok(signed) = sign::sign::<ADVERT_MAX>(self.key.as_ref(), packet) else {
-            return self;
+            return;
         };
         if let Ok(ad) = adv::encode(&signed)
             && ad != self.trade.adv
@@ -238,7 +245,6 @@ impl App {
         if let Ok(frame) = link::encode(&signed) {
             out.push(Effect::LinkSend(frame));
         }
-        self
     }
 
     /// Reports a trade state change; a completed trade also saves the
@@ -284,24 +290,24 @@ impl App {
     }
 
     /// A stock-protocol packet arrived.
-    pub(super) fn radio_packet(mut self, via: Via, rssi: i8, payload: &[u8], out: &mut Out) -> Self {
+    pub(super) fn radio_packet(&mut self, via: Via, rssi: i8, payload: &[u8], out: &mut Out) {
         let before = self.trade.view_key(self.signed());
         let packet = match via {
             Via::Ble => adv::decode_body(payload),
             Via::Link => Vec::from_slice(payload).ok(),
         };
         let Some(packet) = packet else {
-            return self;
+            return;
         };
         let Ok(body) = sign::verify(self.key.as_ref(), &packet) else {
-            return self;
+            return;
         };
         if let Some(p) = lobby::parse(body) {
             if via == Via::Ble && rssi < RSSI_MIN {
-                return self;
+                return;
             }
-            let (session, events) = self.trade.session.on_packet(self.now, via, rssi, &p);
-            self.trade.session = session;
+            let now = self.now;
+            let events = self.trade.step(|s| s.on_packet(now, via, rssi, &p));
             for &e in &events {
                 self.trade_event(e, out);
             }
@@ -309,7 +315,8 @@ impl App {
             && profile.sender != self.trade.me()
             && !profile.name.is_empty()
         {
-            self.trade.session = self.trade.session.named(profile.sender, &profile.name);
+            self.trade
+                .step(|s| (s.named(profile.sender, &profile.name), ()));
             let (list, changed) =
                 core::mem::take(&mut self.contacts).named(profile.sender, &profile.name);
             self.contacts = list;
@@ -319,24 +326,20 @@ impl App {
             }
         }
         self.trade_redraw(before, out);
-        self
     }
 
     /// Storage finished loading: the contacts arrived one by one before
     /// this, the radio key comes with it.
-    pub(super) fn storage_loaded(mut self, key: Option<RadioKey>, out: &mut Out) -> Self {
+    pub(super) fn storage_loaded(&mut self, key: Option<RadioKey>, out: &mut Out) {
         self.key = key;
         self.trade.page = 0;
         self.redraw_if_on(Screen::Trade, out);
         self.redraw_if_on(Screen::Contacts, out);
-        self
     }
 
-    /// A button pressed on TRADE / CONTACTS. `Ok` = handled here, `Err` =
-    /// fall through to normal navigation.
-    // `Result<Self, Self>` hands the app back either way (no copy, no heap).
-    #[allow(clippy::result_large_err)]
-    pub(super) fn trade_button(mut self, button: Button, out: &mut Out) -> Result<Self, Self> {
+    /// A button pressed on TRADE / CONTACTS. Returns `true` if handled
+    /// here, `false` to fall through to normal navigation.
+    pub(super) fn trade_button(&mut self, button: Button, out: &mut Out) -> bool {
         let before = self.trade.view_key(self.signed());
         match self.screen {
             Screen::Trade => {
@@ -348,9 +351,9 @@ impl App {
                         self.trade.cursor = 0;
                     }
                     (false, Button::Start) if self.trade.session.active_peer().is_some() => {
-                        self = self.trade_cancel(out);
+                        self.trade_cancel(out);
                     }
-                    (false, _) => return Err(self),
+                    (false, _) => return false,
                     (true, Button::Left | Button::Right) => {
                         if len > 0 {
                             let at = usize::from(self.trade.cursor).min(len - 1);
@@ -367,11 +370,10 @@ impl App {
                         let at = usize::from(self.trade.cursor);
                         if let Some(row) = rows.get(at).or(rows.last()) {
                             if row.invited {
-                                self = self.trade_cancel(out);
+                                self.trade_cancel(out);
                             } else {
-                                let (session, result) =
-                                    self.trade.session.invite(self.now, row.id);
-                                self.trade.session = session;
+                                let now = self.now;
+                                let result = self.trade.step(|s| s.invite(now, row.id));
                                 if let Ok(events) = result {
                                     for &e in &events {
                                         self.trade_event(e, out);
@@ -381,40 +383,38 @@ impl App {
                         }
                     }
                     (true, Button::Start) => self.trade.pick = false,
-                    (true, _) => return Err(self),
+                    (true, _) => return false,
                 }
                 self.trade_redraw(before, out);
-                Ok(self)
+                true
             }
             Screen::Contacts if button == Button::Select => {
                 let pages = contact_pages(self.contacts.len());
                 let next = (usize::from(self.trade.page) + 1) % pages;
                 self.trade.page = u8::try_from(next).unwrap_or(0);
                 out.redraw();
-                Ok(self)
+                true
             }
-            _ => Err(self),
+            _ => false,
         }
     }
 
     /// Leaves the current trade, reporting it.
-    fn trade_cancel(mut self, out: &mut Out) -> Self {
-        let (session, events) = self.trade.session.cancel(self.now);
-        self.trade.session = session;
+    fn trade_cancel(&mut self, out: &mut Out) {
+        let now = self.now;
+        let events = self.trade.step(|s| s.cancel(now));
         for &e in &events {
             self.trade_event(e, out);
         }
-        self
     }
 
     /// SetChi, TradeInvite, TradeCancel, ListContacts, ClearContacts,
     /// GetLobby. Answers exactly one response.
-    pub(super) fn trade_host(mut self, seq: u32, cmd: Cmd, out: &mut Out) -> Self {
+    pub(super) fn trade_host(&mut self, seq: u32, cmd: Cmd, out: &mut Out) {
         let before = self.trade.view_key(self.signed());
         match cmd {
             Cmd::SetChi(c) => {
-                let (session, result) = self.trade.session.set_chi(c.chi);
-                self.trade.session = session;
+                let result = self.trade.step(|s| s.set_chi(c.chi));
                 match result {
                     Ok(()) => out.ack(seq),
                     Err(ChiError::Unknown) => out.error(seq, ErrorCode::BadArgument, "chi"),
@@ -424,8 +424,8 @@ impl App {
             Cmd::TradeInvite(t) => match PeerId::parse(t.peer.as_bytes()) {
                 Err(_) => out.error(seq, ErrorCode::BadArgument, "peer id"),
                 Ok(peer) => {
-                    let (session, result) = self.trade.session.invite(self.now, peer);
-                    self.trade.session = session;
+                    let now = self.now;
+                    let result = self.trade.step(|s| s.invite(now, peer));
                     match result {
                         Ok(events) => {
                             out.ack(seq);
@@ -442,7 +442,7 @@ impl App {
             },
             Cmd::TradeCancel(_) => {
                 out.ack(seq);
-                self = self.trade_cancel(out);
+                self.trade_cancel(out);
             }
             Cmd::ListContacts(l) => {
                 let offset = usize::try_from(l.offset).unwrap_or(usize::MAX);
@@ -467,7 +467,6 @@ impl App {
             _ => out.error(seq, ErrorCode::Unsupported, "trade"),
         }
         self.trade_redraw(before, out);
-        self
     }
 
     /// The `Lobby` response: peers strongest first.

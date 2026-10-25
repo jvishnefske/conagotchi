@@ -254,6 +254,8 @@ impl<const N: usize> OutBuf<N> {
             Effect::LinkSend(frame) => self.record(Tag::LinkSend, &[frame]),
             Effect::SaveContact(c) => self.message(Tag::SaveContact, &c.to_proto()),
             Effect::ClearContacts => self.record(Tag::ClearContacts, &[]),
+            // Expanded by the guest (`SimBadge`) into a `Send` record first.
+            Effect::SendScan { .. } => Err(WireError::NotARecord),
             Effect::Redraw
             | Effect::Animate
             | Effect::Draw(_)

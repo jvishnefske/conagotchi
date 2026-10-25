@@ -315,6 +315,17 @@ pub enum Effect {
     SaveContact(Contact),
     /// Erase all stored contacts.
     ClearContacts,
+    /// Send the response to a Wi-Fi or BLE scan request: the shell builds the
+    /// message with `App::scan_response` from the next state and sends it like
+    /// [`Effect::Send`]. Scan lists are the largest messages (about 800 B), so
+    /// carrying them inline would make every `Effect` that large; this keeps
+    /// effects small on the MCU stack.
+    SendScan {
+        /// Sequence number of the scan request.
+        seq: u32,
+        /// Which scan.
+        kind: ScanKind,
+    },
     /// Run a wasm runtime command; answer with [`Input::Wasm`].
     Wasm {
         /// Request sequence number.
@@ -322,6 +333,15 @@ pub enum Effect {
         /// What to do.
         cmd: WasmCmd,
     },
+}
+
+/// Which scan an [`Effect::SendScan`] answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanKind {
+    /// Wi-Fi access points (`WifiScanResult`).
+    Wifi,
+    /// BLE advertisers (`BleScanResult`).
+    Ble,
 }
 
 /// Effects produced by one `App::handle` call, in execution order.

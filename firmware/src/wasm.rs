@@ -128,7 +128,16 @@ use crate::storage::{self, PayloadDone, PayloadError, PayloadOp};
 /// `board::PAYLOAD_FUEL_PER_CALL`, the values `badgectl sim` uses too.
 pub const LIMITS: Limits = Limits::bytes(PAYLOAD_MAX_MEMORY).with_fuel(PAYLOAD_FUEL_PER_CALL);
 /// Size of the heap region `main` adds for the payload runtime.
-pub const HEAP_BYTES: usize = 52 * 1024;
+///
+/// This trades heap for main stack, which gets all RAM left over. Measured on
+/// hardware (2026-10-25, stack painted over the debug link, then payload
+/// start/stop, Wi-Fi and BLE scans and a GATT RPC): peak stack use is about
+/// 53.5 KB, because every embassy task, including this one compiling a
+/// payload, runs on the one main stack. 16 KiB here leaves about 64.7 KB of
+/// stack (about 11 KB margin). With it, a ~6 KB payload starts with about
+/// 36 KB of heap still free; payloads near `PAYLOAD_MAX_IMAGE` may be refused
+/// with BUSY by the free-heap guard.
+pub const HEAP_BYTES: usize = 16 * 1024;
 /// Longest sleep when no tick is due (the loop then re-checks).
 pub const IDLE_MS: u32 = 1_000;
 /// Interval between drop / timing reports.

@@ -5,6 +5,15 @@
 //! state and one [`Input`] and returns the next state plus the [`Effects`] the
 //! shell must carry out. It never touches hardware and never allocates.
 //!
+//! The public transition stays a pure function of (state, input) to (state,
+//! effects): `handle` takes the state by value and returns the next one, and
+//! nothing outside it can observe an intermediate state. Inside, the state is
+//! moved once into a local and the private helpers mutate it through
+//! `&mut self` instead of taking and returning `Self` by value. `App` is
+//! several kilobytes and a chain of by-value helpers (tick, trade lobby,
+//! beacon) is not guaranteed copy elision, so each level could copy the whole
+//! state onto the stack and overflow the MCU's main task stack.
+//!
 //! Protocol rules enforced here:
 //! - every `HostMsg` gets exactly one `Response` echoing its `seq` (FR-6),
 //!   either immediately or when the shell reports the matching result;
@@ -58,7 +67,7 @@ use crate::color::Color;
 use crate::contacts::Contacts;
 use crate::io::{
     ButtonMask, DrawOp, Effect, Effects, Input, MAX_APS, MAX_BLE, MAX_EFFECTS, Millis,
-    StorageEvent,
+    ScanKind, StorageEvent,
 };
 use crate::leds::{self, DEFAULT_BRIGHTNESS};
 use crate::oz::sign::RadioKey;
@@ -251,12 +260,12 @@ pub struct App {
 }
 
 /// Effects being collected for one `handle` call.
-struct Out {
-    fx: Effects,
+struct Out<'a> {
+    fx: &'a mut Effects,
     dropped: u32,
 }
 
-impl Out {
+impl Out<'_> {
     fn push(&mut self, effect: Effect) {
         if self.fx.push(effect).is_err() {
             self.dropped = self.dropped.saturating_add(1);
@@ -370,66 +379,80 @@ impl App {
     /// Applies one input; returns the next state and the effects to perform,
     /// in order. Never returns more than [`MAX_EFFECTS`] effects.
     pub fn handle(self, input: Input) -> (App, Effects) {
-        let mut out = Out {
-            fx: Effects::new(),
-            dropped: 0,
-        };
+        let mut app = self;
+        let mut fx = Effects::new();
+        app.step(input, &mut fx);
+        (app, fx)
+    }
+
+    /// The same transition as [`App::handle`], applied in place: replaces
+    /// the contents of `fx` with the effects of `input`. For the firmware,
+    /// which keeps the app and one effect buffer in its task state so that
+    /// neither (5 KB and 10 KB) is copied onto the MCU stack per input.
+    pub fn step(&mut self, input: Input, fx: &mut Effects) {
+        fx.clear();
+        let mut out = Out { fx, dropped: 0 };
         let pet_before = self.pet;
-        let next = match input {
-            Input::Tick { now, buttons } => self.tick(now, buttons, &mut out),
-            Input::Host(msg) => self.count_rx(false).host(msg, &mut out),
+        self.dispatch(input, &mut out);
+        self.refresh_leds(&mut out);
+        self.pet_output(pet_before, &mut out);
+        self.finish(&out);
+    }
+
+    /// Routes one input to its handler, mutating the state in place.
+    fn dispatch(&mut self, input: Input, out: &mut Out) {
+        match input {
+            Input::Tick { now, buttons } => self.tick(now, buttons, out),
+            Input::Host(msg) => {
+                self.count_rx(false);
+                self.host(msg, out);
+            }
             Input::HostGarbage => {
                 out.error(0, ErrorCode::Decode, "undecodable frame");
-                self.count_rx(true)
+                self.count_rx(true);
             }
-            Input::Gpio { seq, pin, result } => self.gpio_done(seq, pin, result, &mut out),
-            Input::Adc { seq, result } => {
-                match result {
-                    Ok(level) => out.respond(seq, Body::Adc(level)),
-                    Err(code) => out.error(seq, code, "adc"),
-                }
-                self
-            }
-            Input::WifiScanned { seq, result } => self.wifi_scanned(seq, result, &mut out),
-            Input::Wifi { seq, result } => self.wifi_state(seq, result, &mut out),
-            Input::BleScanned { seq, result } => self.ble_scanned(seq, result, &mut out),
-            Input::BleAdvertised { seq, result } => self.ble_advertised(seq, result, &mut out),
+            Input::Gpio { seq, pin, result } => self.gpio_done(seq, pin, result, out),
+            Input::Adc { seq, result } => match result {
+                Ok(level) => out.respond(seq, Body::Adc(level)),
+                Err(code) => out.error(seq, code, "adc"),
+            },
+            Input::WifiScanned { seq, result } => self.wifi_scanned(seq, result, out),
+            Input::Wifi { seq, result } => self.wifi_state(seq, result, out),
+            Input::BleScanned { seq, result } => self.ble_scanned(seq, result, out),
+            Input::BleAdvertised { seq, result } => self.ble_advertised(seq, result, out),
             Input::RadioPacket { via, rssi, payload } => {
-                self.radio_packet(via, rssi, &payload, &mut out)
+                self.radio_packet(via, rssi, &payload, out);
             }
-            Input::BleStats(stats) => self.ble_stats(stats, &mut out),
+            Input::BleStats(stats) => self.ble_stats(stats, out),
             Input::SyncBeacon {
                 from,
                 network_ms,
                 rx_at,
             } => {
-                let mut next = self;
-                next.sync = next.sync.on_beacon(from, network_ms, rx_at);
-                next
+                self.sync = self.sync.on_beacon(from, network_ms, rx_at);
             }
             Input::Storage(StorageEvent::Contact(contact)) => {
-                let mut next = self;
-                next.contacts = next.contacts.with(contact);
-                next
+                self.contacts = core::mem::take(&mut self.contacts).with(contact);
             }
-            Input::Storage(StorageEvent::Loaded { key }) => self.storage_loaded(key, &mut out),
-            Input::Wasm { seq, result } => {
-                Self::wasm_done(seq, result, &mut out);
-                self
-            }
-            Input::WasmLog(text) => {
-                Self::wasm_log(text, &mut out);
-                self
-            }
-        };
-        let next = next
-            .refresh_leds(&mut out)
-            .pet_output(pet_before, &mut out)
-            .finish(&out);
-        (next, out.fx)
+            Input::Storage(StorageEvent::Loaded { key }) => self.storage_loaded(key, out),
+            Input::Wasm { seq, result } => Self::wasm_done(seq, result, out),
+            Input::WasmLog(text) => Self::wasm_log(text, out),
+        }
     }
 
     // ------------------------------------------------------------ accessors
+
+    /// The response an [`Effect::SendScan`] stands for, built from the stored
+    /// scan results (call it on the state `handle` returned).
+    pub fn scan_response(&self, kind: ScanKind, seq: u32) -> BadgeMsg {
+        let body = match kind {
+            ScanKind::Wifi => Body::WifiScan(WifiScanResult { aps: self.aps.clone() }),
+            ScanKind::Ble => Body::BleScan(BleScanResult { devices: self.ble.clone() }),
+        };
+        BadgeMsg {
+            kind: Some(BadgeMsg_::Kind::Response(Response { seq, body: Some(body) })),
+        }
+    }
 
     /// Board facts supplied at boot.
     pub fn info(&self) -> BoardInfo {
@@ -564,20 +587,19 @@ impl App {
 
     // ------------------------------------------------------------ internals
 
-    fn count_rx(mut self, garbage: bool) -> Self {
+    fn count_rx(&mut self, garbage: bool) {
         self.counters.frames_rx = self.counters.frames_rx.wrapping_add(1);
         if garbage {
             self.counters.decode_errors = self.counters.decode_errors.wrapping_add(1);
         }
-        self
     }
 
     /// Books the effects of this call into the counters and redraw tracking.
-    fn finish(mut self, out: &Out) -> Self {
+    fn finish(&mut self, out: &Out) {
         let sent = out
             .fx
             .iter()
-            .filter(|e| matches!(e, Effect::Send(_)))
+            .filter(|e| matches!(e, Effect::Send(_) | Effect::SendScan { .. }))
             .count();
         let sent = u32::try_from(sent).unwrap_or(u32::MAX);
         self.counters.frames_tx = self.counters.frames_tx.wrapping_add(sent);
@@ -585,11 +607,10 @@ impl App {
         if out.fx.contains(&Effect::Redraw) {
             self.drawn = Some((self.now, self.leds));
         }
-        self
     }
 
     /// Re-renders the LED chain; emits `Leds` only if a colour changed.
-    fn refresh_leds(mut self, out: &mut Out) -> Self {
+    fn refresh_leds(&mut self, out: &mut Out) {
         let leds = leds::render(
             self.pattern,
             &self.manual,
@@ -600,17 +621,15 @@ impl App {
             self.leds = leds;
             out.push(Effect::Leds(leds));
         }
-        self
     }
 
     /// Switches screen; a real change emits `Redraw` then `ScreenChanged`.
-    fn set_screen(mut self, screen: Screen, out: &mut Out) -> Self {
+    fn set_screen(&mut self, screen: Screen, out: &mut Out) {
         if screen != self.screen {
             self.screen = screen;
             out.redraw();
             out.event(Event_::Kind::Screen(ScreenChanged { screen }));
         }
-        self
     }
 
     /// Display effects and the `PetChanged` event for the pet having gone
@@ -619,7 +638,7 @@ impl App {
     /// On the PET screen a mode change (selected or active) redraws, and a
     /// picture-only change animates unless a redraw is already queued.
     /// `PetChanged` is sent only if a slot is left, else on a later call.
-    fn pet_output(mut self, before: Pet, out: &mut Out) -> Self {
+    fn pet_output(&mut self, before: Pet, out: &mut Out) {
         let pair = (self.pet.selected(), self.pet.active());
         if self.screen == Screen::Pet {
             if pair != (before.selected(), before.active()) {
@@ -635,7 +654,6 @@ impl App {
                 active: pair.1,
             }));
         }
-        self
     }
 
     /// Requests a redraw if `screen` is the one showing.
@@ -645,7 +663,7 @@ impl App {
         }
     }
 
-    fn tick(mut self, now: Millis, raw: ButtonMask, out: &mut Out) -> Self {
+    fn tick(&mut self, now: Millis, raw: ButtonMask, out: &mut Out) {
         self.now = now;
         // Advance first so a SELECT edge in this tick restarts at `now`.
         self.pet = self.pet.advance(now).0;
@@ -661,13 +679,13 @@ impl App {
                 at_ms: now.0,
             }));
             if pressed {
-                self = self.button_pressed(button, out);
+                self.button_pressed(button, out);
             }
         }
         if !edges.is_empty() {
             self.redraw_if_on(Screen::Buttons, out);
         }
-        self = self.trade_tick(out);
+        self.trade_tick(out);
         let (sync, beacon) = self.sync.tick(now);
         self.sync = sync;
         if let Some(b) = beacon {
@@ -676,7 +694,7 @@ impl App {
                 network_ms: b.network_ms,
             });
         }
-        self = self.refresh_leds(out);
+        self.refresh_leds(out);
         let stale = match self.drawn {
             None => true,
             Some((at, shown)) => match self.screen {
@@ -687,33 +705,29 @@ impl App {
         if stale {
             out.redraw();
         }
-        self
     }
 
     /// Navigation and screen actions for a debounced press.
-    fn button_pressed(mut self, button: Button, out: &mut Out) -> Self {
+    fn button_pressed(&mut self, button: Button, out: &mut Out) {
         if let Some(count) = button_index(button).and_then(|i| self.press_counts.get_mut(i)) {
             *count = count.wrapping_add(1);
         }
         let screen = self.screen;
-        if matches!(screen, Screen::Trade | Screen::Contacts) {
-            match self.trade_button(button, out) {
-                Ok(handled) => return handled,
-                Err(unhandled) => self = unhandled,
-            }
+        if matches!(screen, Screen::Trade | Screen::Contacts) && self.trade_button(button, out) {
+            return;
         }
         match button {
             Button::Left => self.set_screen(cycle_screen(screen, -1), out),
             Button::Right => self.set_screen(cycle_screen(screen, 1), out),
             Button::Select => self.select(out),
-            _ => self,
+            _ => {}
         }
     }
 
     /// SELECT: PET → next pet mode, LEDS → next pattern (OFF → RAINBOW →
     /// BREATHE), WIFI / BLE → start a scan unless busy. TRADE / CONTACTS
     /// buttons are handled by [`trade`] first.
-    fn select(mut self, out: &mut Out) -> Self {
+    fn select(&mut self, out: &mut Out) {
         match self.screen {
             // Display effects and `PetChanged` follow from `pet_output`.
             Screen::Pet => self.pet = self.pet.next_mode(self.now),
@@ -736,14 +750,13 @@ impl App {
             }
             _ => {}
         }
-        self
     }
 
-    fn host(mut self, msg: HostMsg, out: &mut Out) -> Self {
+    fn host(&mut self, msg: HostMsg, out: &mut Out) {
         let seq = msg.seq;
         let Some(cmd) = msg.cmd else {
             out.error(seq, ErrorCode::Unsupported, "no command");
-            return self;
+            return;
         };
         match cmd {
             Cmd::Ping(p) => {
@@ -827,7 +840,7 @@ impl App {
             }
             Cmd::ShowScreen(s) => {
                 if SCREEN_ORDER.contains(&s.screen) {
-                    self = self.set_screen(s.screen, out);
+                    self.set_screen(s.screen, out);
                     out.ack(seq);
                 } else {
                     out.error(seq, ErrorCode::BadArgument, "screen");
@@ -839,19 +852,19 @@ impl App {
                     fg: t.fg.map_or(Color::WHITE, |c| Color::from_packed(c.rgb)),
                     bg: t.bg.map_or(Color::BLACK, |c| Color::from_packed(c.rgb)),
                 };
-                self = self.set_screen(Screen::Host, out);
+                self.set_screen(Screen::Host, out);
                 out.redraw();
                 out.ack(seq);
             }
             Cmd::DisplayFill(f) => {
                 let color = Color::from_packed(f.color.map_or(0, |c| c.rgb));
-                self = self.set_screen(Screen::Host, out);
+                self.set_screen(Screen::Host, out);
                 out.push(Effect::Draw(DrawOp::Fill(color)));
                 out.ack(seq);
             }
             Cmd::DisplayRect(r) => match rect_op(&r) {
                 Some(op) => {
-                    self = self.set_screen(Screen::Host, out);
+                    self.set_screen(Screen::Host, out);
                     out.push(Effect::Draw(op));
                     out.ack(seq);
                 }
@@ -943,7 +956,7 @@ impl App {
             Cmd::SetPetMode(m) => match self.pet.select(m.mode, self.now) {
                 Ok(pet) => {
                     self.pet = pet;
-                    self = self.set_screen(Screen::Pet, out);
+                    self.set_screen(Screen::Pet, out);
                     out.ack(seq);
                 }
                 Err(_) => out.error(seq, ErrorCode::BadArgument, "pet mode"),
@@ -976,24 +989,22 @@ impl App {
             | Cmd::TradeCancel(_)
             | Cmd::ListContacts(_)
             | Cmd::ClearContacts(_)
-            | Cmd::GetLobby(_)) => self = self.trade_host(seq, cmd, out),
+            | Cmd::GetLobby(_)) => self.trade_host(seq, cmd, out),
             cmd @ (Cmd::WasmBegin(_)
             | Cmd::WasmChunk(_)
             | Cmd::WasmCommit(_)
             | Cmd::WasmStart(_)
             | Cmd::WasmStop(_)
-            | Cmd::GetWasm(_)) => self = self.wasm_host(seq, cmd, out),
+            | Cmd::GetWasm(_)) => self.wasm_host(seq, cmd, out),
         }
-        self
     }
 
     /// Stores fresh BLE metrics; the BLE screen shows them.
-    fn ble_stats(mut self, stats: BleSnapshot, out: &mut Out) -> Self {
+    fn ble_stats(&mut self, stats: BleSnapshot, out: &mut Out) {
         if stats != self.ble_stats {
             self.ble_stats = stats;
             self.redraw_if_on(Screen::Ble, out);
         }
-        self
     }
 
     fn info_body(&self) -> Info {
@@ -1020,27 +1031,26 @@ impl App {
     }
 
     fn gpio_done(
-        mut self,
+        &mut self,
         seq: u32,
         pin: u32,
         result: Result<bool, ErrorCode>,
         out: &mut Out,
-    ) -> Self {
+    ) {
         self.gpio = Some(GpioResult { pin, result });
         self.redraw_if_on(Screen::Gpio, out);
         match result {
             Ok(level) => out.respond(seq, Body::Gpio(GpioLevel { pin, level })),
             Err(code) => out.error(seq, code, "gpio"),
         }
-        self
     }
 
     fn wifi_scanned(
-        mut self,
+        &mut self,
         seq: Option<u32>,
         result: Result<Vec<AccessPoint, MAX_APS>, ErrorCode>,
         out: &mut Out,
-    ) -> Self {
+    ) {
         match result {
             Ok(aps) => {
                 self.aps = aps;
@@ -1052,23 +1062,17 @@ impl App {
         if let Some(seq) = seq {
             match self.wifi_scan {
                 ScanState::Failed(code) => out.error(seq, code, "wifi scan"),
-                _ => out.respond(
-                    seq,
-                    Body::WifiScan(WifiScanResult {
-                        aps: self.aps.clone(),
-                    }),
-                ),
+                _ => out.push(Effect::SendScan { seq, kind: ScanKind::Wifi }),
             }
         }
-        self
     }
 
     fn wifi_state(
-        mut self,
+        &mut self,
         seq: Option<u32>,
         result: Result<WifiState, ErrorCode>,
         out: &mut Out,
-    ) -> Self {
+    ) {
         self.wifi = result;
         self.redraw_if_on(Screen::Wifi, out);
         if let Some(seq) = seq {
@@ -1077,15 +1081,14 @@ impl App {
                 Err(code) => out.error(seq, *code, "wifi"),
             }
         }
-        self
     }
 
     fn ble_scanned(
-        mut self,
+        &mut self,
         seq: Option<u32>,
         result: Result<Vec<BleDevice, MAX_BLE>, ErrorCode>,
         out: &mut Out,
-    ) -> Self {
+    ) {
         match result {
             Ok(devices) => {
                 self.ble = devices;
@@ -1097,18 +1100,12 @@ impl App {
         if let Some(seq) = seq {
             match self.ble_scan {
                 ScanState::Failed(code) => out.error(seq, code, "ble scan"),
-                _ => out.respond(
-                    seq,
-                    Body::BleScan(BleScanResult {
-                        devices: self.ble.clone(),
-                    }),
-                ),
+                _ => out.push(Effect::SendScan { seq, kind: ScanKind::Ble }),
             }
         }
-        self
     }
 
-    fn ble_advertised(mut self, seq: u32, result: Result<(), ErrorCode>, out: &mut Out) -> Self {
+    fn ble_advertised(&mut self, seq: u32, result: Result<(), ErrorCode>, out: &mut Out) {
         match result {
             Ok(()) => {
                 self.advertising = self.adv_request.clone();
@@ -1117,7 +1114,6 @@ impl App {
             }
             Err(code) => out.error(seq, code, "ble advertise"),
         }
-        self
     }
 }
 

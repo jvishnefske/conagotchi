@@ -111,6 +111,10 @@ impl SimBadge {
                         let Ok(()) = fb::apply_draw_op(*op, &mut FrameBuffer::new(fb));
                         badge.note(out.screen(ScreenChange::Draw))
                     }
+                    Effect::SendScan { seq, kind } => {
+                        let msg = Effect::Send(badge.app.scan_response(*kind, *seq));
+                        badge.note(out.effect(&msg))
+                    }
                     other => match local_answer(other) {
                         Some(answer) => {
                             let full = pending.push(answer).is_err();

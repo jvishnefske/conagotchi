@@ -22,26 +22,26 @@ use crate::io::{Effect, WASM_LOG_LEN, WasmCmd};
 impl App {
     /// Runs a payload request through the loader and forwards the outcome to
     /// the runtime.
-    pub(super) fn wasm_host(mut self, seq: u32, cmd: Cmd, out: &mut Out) -> Self {
+    pub(super) fn wasm_host(&mut self, seq: u32, cmd: Cmd, out: &mut Out) {
         let command = match &cmd {
             Cmd::WasmBegin(b) => Command::Begin { len: b.len, crc: b.crc32 },
             Cmd::WasmChunk(c) => Command::Chunk { offset: c.offset, data: &c.data },
             Cmd::WasmCommit(_) => Command::Commit,
             Cmd::WasmStart(_) => {
                 out.push(Effect::Wasm { seq, cmd: WasmCmd::Start });
-                return self;
+                return;
             }
             Cmd::WasmStop(_) => {
                 out.push(Effect::Wasm { seq, cmd: WasmCmd::Stop });
-                return self;
+                return;
             }
             Cmd::GetWasm(_) => {
                 out.push(Effect::Wasm { seq, cmd: WasmCmd::Status });
-                return self;
+                return;
             }
             _ => {
                 out.error(seq, ErrorCode::Unsupported, "not a wasm request");
-                return self;
+                return;
             }
         };
         let (loader, step) = self.loader.step(&command, PAYLOAD_MAX_IMAGE);
@@ -54,18 +54,17 @@ impl App {
                 if chunk.extend_from_slice(data).is_err() {
                     self.loader = Loader::Idle;
                     out.error(seq, ErrorCode::BadArgument, "wasm chunk too long");
-                    return self;
+                    return;
                 }
                 WasmCmd::Write { offset, data: chunk }
             }
             Ok(LoaderEffect::Activate { len, crc }) => WasmCmd::Activate { len, crc },
             Err(_) => {
                 out.error(seq, ErrorCode::BadArgument, "wasm upload rejected; restart with WasmBegin");
-                return self;
+                return;
             }
         };
         out.push(Effect::Wasm { seq, cmd });
-        self
     }
 
     /// The runtime answered a payload request.
