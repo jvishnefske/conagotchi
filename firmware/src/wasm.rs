@@ -71,9 +71,23 @@
 //!   are `InvalidKey`, malformed payloads `InvalidArgument`, full queues
 //!   `Transport`;
 //! - `now_ms` → embassy time;
-//! - `gpio_*` → `Unsupported` in every build. The probe pins belong to the
-//!   shell's `GpioProbe` (dev builds); routing payload GPIO through the
-//!   shell is a follow-up;
+//! - `gpio_*` → in `dev` builds, the probe pins
+//!   (`badge_core::board::PROBE_PINS`; any other pin is `Unsupported`). The
+//!   pure `badge_mw::payload::gpio::PayloadPins` table (one per loaded
+//!   payload, so a new payload starts with every pin unset) decides each
+//!   call: `gpio_output` drives low, `gpio_input` sets the pull,
+//!   `gpio_write` needs an output and `gpio_read` an input (pad level) or
+//!   output (driven level, no pin access), else `InvalidArgument`. The
+//!   resulting operation runs synchronously, within the call, on the
+//!   shell's `GpioProbe`, borrowed from `gpio_probe`'s slot for that call
+//!   only (`gpio_probe::with`; there is no handshake with the shell task,
+//!   which cannot run while a payload call is in progress, so nothing can
+//!   deadlock). No probe is `Unsupported`, a probe in use `Busy`, a probe
+//!   failure `Transport`. The table is updated only when the operation
+//!   succeeded. Pins stay as the payload left them when it stops; the host
+//!   `GpioRead` / `GpioWrite` commands share the pins, and the payload's
+//!   next call re-applies its configuration. Release builds have no probe
+//!   and answer `Unsupported`;
 //! - the ABI 2 calls (IRQs, timers, SPI, UART) keep wasm-host's
 //!   `Unsupported` defaults.
 //!
@@ -134,15 +148,22 @@ use crate::storage::{self, PayloadDone, PayloadError, PayloadOp};
 pub const LIMITS: Limits = Limits::bytes(PAYLOAD_MAX_MEMORY).with_fuel(PAYLOAD_FUEL_PER_CALL);
 /// Size of the heap region `main` adds for the payload runtime.
 ///
-/// This trades heap for main stack, which gets all RAM left over. Measured on
-/// hardware (2026-10-25, stack painted over the debug link, then payload
-/// start/stop, Wi-Fi and BLE scans and a GATT RPC): peak stack use is about
-/// 53.5 KB, because every embassy task, including this one compiling a
-/// payload, runs on the one main stack. 16 KiB here leaves about 64.7 KB of
-/// stack (about 11 KB margin). With it, a ~6 KB payload starts with about
-/// 36 KB of heap still free; payloads near `PAYLOAD_MAX_IMAGE` may be refused
-/// with BUSY by the free-heap guard.
-pub const HEAP_BYTES: usize = 16 * 1024;
+/// This trades heap for main stack, which gets all RAM left over (`.stack`
+/// in `xtensa-esp32s3-elf-size -A`), and every embassy task, including this
+/// one compiling a payload, runs on that one stack.
+///
+/// History: with 16 KiB the stack was 57,168 B and a hardware soak
+/// (2026-10-25, stack painted) peaked at 54,512 B, because the core loop's
+/// poll function had a 43 KB frame (the whole tick inlined into `main`'s
+/// future). The shell now keeps that frame small (`shell::run`), and
+/// `scripts/stack-report.py` puts the deepest static chain of any task at
+/// about 16.3 KB (the core loop: tick → feed → `App::step` → trade
+/// handling), plus about 0.9 KB of executor and up to about 3 KB of
+/// interrupt frames. 28 KiB here leaves about 46.2 KB of stack, so about
+/// 26 KB of margin by that analysis (indirect calls, such as wasmi into the
+/// host functions, are not followed and need the hardware measurement).
+/// The free-heap guard still refuses (BUSY) a payload that would not fit.
+pub const HEAP_BYTES: usize = 28 * 1024;
 /// Longest sleep when no tick is due (the loop then re-checks).
 pub const IDLE_MS: u32 = 1_000;
 /// Interval between drop / timing reports.
@@ -242,6 +263,18 @@ fn now_ms() -> u32 {
 pub struct BadgeDevice {
     /// Last LED frame sent to the core.
     last_leds: Option<[u8; 24]>,
+    /// Modes this payload gave the probe pins (`dev` builds only).
+    #[cfg(feature = "dev")]
+    pins: badge_mw::payload::gpio::PayloadPins,
+}
+
+/// Runs one payload pin operation on the shared probe (`dev` builds).
+#[cfg(feature = "dev")]
+fn probe_op(op: badge_mw::payload::gpio::PinOp) -> Result<bool, AbiError> {
+    use badge_mw::payload::gpio::probe_error;
+    crate::gpio_probe::with(|probe| probe.apply(op))
+        .map_err(|e| e.abi_error())?
+        .map_err(probe_error)
 }
 
 impl BadgeDevice {
@@ -287,18 +320,54 @@ impl Device for BadgeDevice {
         now_ms()
     }
 
+    #[cfg(feature = "dev")]
+    fn gpio_output(&mut self, pin: u8) -> Result<(), AbiError> {
+        let (pins, op) = self.pins.output(pin)?;
+        probe_op(op)?;
+        self.pins = pins;
+        Ok(())
+    }
+
+    #[cfg(feature = "dev")]
+    fn gpio_input(&mut self, pin: u8, pull: Pull) -> Result<(), AbiError> {
+        let (pins, op) = self.pins.input(pin, pull)?;
+        probe_op(op)?;
+        self.pins = pins;
+        Ok(())
+    }
+
+    #[cfg(feature = "dev")]
+    fn gpio_write(&mut self, pin: u8, high: bool) -> Result<(), AbiError> {
+        let (pins, op) = self.pins.write(pin, high)?;
+        probe_op(op)?;
+        self.pins = pins;
+        Ok(())
+    }
+
+    #[cfg(feature = "dev")]
+    fn gpio_read(&mut self, pin: u8) -> Result<bool, AbiError> {
+        match self.pins.read(pin)? {
+            badge_mw::payload::gpio::ReadStep::Level(level) => Ok(level),
+            badge_mw::payload::gpio::ReadStep::Apply(op) => probe_op(op),
+        }
+    }
+
+    #[cfg(not(feature = "dev"))]
     fn gpio_output(&mut self, _pin: u8) -> Result<(), AbiError> {
         Err(AbiError::Unsupported)
     }
 
+    #[cfg(not(feature = "dev"))]
     fn gpio_input(&mut self, _pin: u8, _pull: Pull) -> Result<(), AbiError> {
         Err(AbiError::Unsupported)
     }
 
+    #[cfg(not(feature = "dev"))]
     fn gpio_write(&mut self, _pin: u8, _high: bool) -> Result<(), AbiError> {
         Err(AbiError::Unsupported)
     }
 
+    #[cfg(not(feature = "dev"))]
     fn gpio_read(&mut self, _pin: u8) -> Result<bool, AbiError> {
         Err(AbiError::Unsupported)
     }

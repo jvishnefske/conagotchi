@@ -24,11 +24,37 @@
 //!   at most [`MAX_POLLS`] times, so the call is bounded. ADC2 pins
 //!   (GPIO 15..18) are not sampled: ADC2 is shared with Wi-Fi on the S3.
 //!
+//! - [`GpioProbe::apply`] carries out a payload's pin operation
+//!   (`badge_mw::payload::gpio::PinOp`): an input with a pull resistor,
+//!   sampled, or a driven output, read back.
+//!
 //! Requests for any other pin return `ErrorCode::PinNotAllowed`; the core
 //! already filters them, this is a second line of defence.
+//!
+//! # Ownership: one slot, handed out per call
+//!
+//! Two users share the probe: the shell (host `GpioRead` / `GpioWrite` /
+//! `AdcRead`) and the wasm task (a payload's `gpio_*` calls,
+//! `wasm::BadgeDevice`). Both run as tasks of the one embassy executor, and
+//! a payload's host call is synchronous, so the shell can never run while a
+//! payload call waits: a request/answer handshake between the two would
+//! only ever time out. Instead `main` [`install`]s the probe in one static
+//! slot, and each user borrows it for the duration of one synchronous call
+//! through [`with`]: the probe is taken out of the slot (a short critical
+//! section), used with interrupts enabled, and put back before `with`
+//! returns. Nothing holds it across an `await`, so on one executor the slot
+//! is never found empty; if it were (a reentrant call), `with` answers
+//! `Unavailable::InUse` instead of waiting. A probe that failed setup or was
+//! never installed is `Unavailable::Absent`.
+
+use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use badge_core::board::{ADC_PINS, PROBE_PINS};
+use badge_mw::payload::gpio::{AbiPull, PinOp, Unavailable};
 use badge_proto::{AdcLevel, ErrorCode};
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use esp_hal::analog::adc::{Adc, AdcCalCurve, AdcChannel, AdcConfig, Attenuation};
 use esp_hal::gpio::{AnalogPin, AnyPin, Flex, InputConfig, Level, OutputConfig, Pin, Pull};
 use esp_hal::peripherals::{ADC1, GPIO1, GPIO3, GPIO5, GPIO6, GPIO7, GPIO8};
@@ -39,6 +65,34 @@ pub const FLEX_COUNT: usize = PROBE_PINS.len() - ADC_PINS.len();
 pub const COUNT: usize = PROBE_PINS.len();
 /// Polls of one conversion before giving up (a conversion takes a few µs).
 pub const MAX_POLLS: u32 = 10_000;
+
+/// The probe's slot (see the module docs); empty until [`install`].
+static SLOT: Mutex<CriticalSectionRawMutex, Cell<Option<GpioProbe>>> = Mutex::new(Cell::new(None));
+
+/// Puts the probe in its slot for [`with`]; called once by `main`.
+pub fn install(probe: GpioProbe) {
+    SLOT.lock(|slot| slot.set(Some(probe)));
+    INSTALLED.store(true, Ordering::Relaxed);
+}
+
+/// Runs `f` on the probe, taken out of its slot for the call and put back
+/// afterwards.
+///
+/// # Errors
+///
+/// `Unavailable::Absent` if no probe was installed, `Unavailable::InUse` if
+/// another caller has it (never on one executor, see the module docs).
+pub fn with<R>(f: impl FnOnce(&mut GpioProbe) -> R) -> Result<R, Unavailable> {
+    let Some(mut probe) = SLOT.lock(Cell::take) else {
+        return Err(Unavailable::empty_slot(INSTALLED.load(Ordering::Relaxed)));
+    };
+    let result = f(&mut probe);
+    SLOT.lock(|slot| slot.set(Some(probe)));
+    Ok(result)
+}
+
+/// Set by [`install`]: tells an empty slot in use from no probe at all.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// One non-ADC probe pin: its GPIO number and driver.
 pub struct ProbePin {
@@ -151,6 +205,25 @@ impl GpioProbe {
         })
     }
 
+    /// Makes `pin` an input with `pull` and returns its pad level.
+    pub fn sense(&mut self, pin: u32, pull: Pull) -> Result<bool, ErrorCode> {
+        self.with_flex(pin, |flex| {
+            flex.set_output_enable(false);
+            flex.apply_input_config(&InputConfig::default().with_pull(pull));
+            flex.set_input_enable(true);
+            flex.is_high()
+        })
+    }
+
+    /// Carries out a payload's pin operation; returns the level read from
+    /// the pad (for a `Drive`, the read-back as in [`GpioProbe::write`]).
+    pub fn apply(&mut self, op: PinOp) -> Result<bool, ErrorCode> {
+        match op {
+            PinOp::Sense { pin, pull } => self.sense(u32::from(pin), hal_pull(pull)),
+            PinOp::Drive { pin, level } => self.write(u32::from(pin), level),
+        }
+    }
+
     /// Samples an ADC1 probe pin `samples` times (1..=64, checked by the
     /// core) and returns mean / min / max in millivolts.
     pub fn adc_read(&mut self, pin: u32, samples: u32) -> Result<AdcLevel, ErrorCode> {
@@ -166,6 +239,15 @@ impl GpioProbe {
         }?;
         let n = samples.max(1);
         Ok(AdcLevel { pin, millivolts: sum / n, min_mv: min, max_mv: max, samples: n })
+    }
+}
+
+/// The esp-hal pull for an ABI pull.
+const fn hal_pull(pull: AbiPull) -> Pull {
+    match pull {
+        AbiPull::None => Pull::None,
+        AbiPull::Up => Pull::Up,
+        AbiPull::Down => Pull::Down,
     }
 }
 

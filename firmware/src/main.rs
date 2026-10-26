@@ -10,8 +10,9 @@
 //!    payload runtime and its image buffer allocate;
 //! 3. the esp-rtos scheduler on TIMG0 / `FROM_CPU_INTR0`;
 //! 4. drivers: buttons, indicators, WS2812 chain, GC9A01 display and, in
-//!    `dev` builds only, the GPIO probe pins (each failure is logged and that
-//!    driver is left out); the buttons are sampled once here, and SELECT held
+//!    `dev` builds only, the GPIO probe pins, installed in `gpio_probe`'s
+//!    slot shared by the shell and payload GPIO calls (each failure is
+//!    logged and that driver is left out); the buttons are sampled once here, and SELECT held
 //!    while the badge boots selects payload safe mode (not BOOT, a strapping
 //!    pin that enters the ROM download mode when held through a reset);
 //! 5. the radio task ([`radio::start`]), the flash storage task
@@ -24,6 +25,15 @@
 //!    USB-Serial-JTAG CDC port, next to RTT on its JTAG side);
 //! 6. the core loop, with [`BoardInfo`] built from the eFuse base MAC and the
 //!    crate name and version.
+//!
+//! Steps 1 to 5 and building the core loop state ([`shell::prepare`]) run
+//! in out-of-line synchronous functions (`setup`, `boot`), so `main`'s
+//! future holds only a reference to the shell state and the frame of each
+//! of its polls stays small (48 B): all embassy tasks share the one main
+//! stack, which is the RAM left after `.data`, `.bss` and the heap regions
+//! (`.stack` in `xtensa-esp32s3-elf-size -A`, about 46 KB with the 28 KiB
+//! [`wasm::HEAP_BYTES`]). `scripts/stack-report.py` reports each task's
+//! deepest static call chain from the ELF.
 //!
 //! Modules: [`rtt`] (transport), [`buttons`], [`leds`], [`display`],
 //! `gpio_probe` (`dev` feature only), [`probe`] (debugger status block),
@@ -88,6 +98,26 @@ static DISPLAY_BUFFER: ConstStaticCell<[u8; display::BUFFER_LEN]> =
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
+    let shell = setup(&spawner);
+    shell::run(shell).await
+}
+
+/// Boots the badge and builds the core loop state; out of line so `main`'s
+/// future (and the frame of each of its polls) holds only a reference.
+#[inline(never)]
+fn setup(spawner: &Spawner) -> &'static mut shell::Shell {
+    let (hw, info) = boot(spawner);
+    shell::prepare(hw, info)
+}
+
+/// Brings the badge up (steps 1 to 5 of the module docs) and returns the
+/// drivers and identity for the core loop.
+///
+/// Kept out of line: inlined into `main`'s future, its temporaries (driver
+/// construction, task futures moved into their pools) would enlarge the
+/// stack frame of every later poll of the core loop.
+#[inline(never)]
+fn boot(spawner: &Spawner) -> (Hardware, BoardInfo) {
     let link = HOST_LINK.init(rtt::init());
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
@@ -154,7 +184,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // GPIO probe pins are claimed only in dev builds.
     #[cfg(feature = "dev")]
-    let gpio = {
+    {
         // ADC1-capable pins are held raw (digital or ADC driver per request).
         let adc_pins = AdcPins {
             gpio1: peripherals.GPIO1,
@@ -178,39 +208,37 @@ async fn main(spawner: Spawner) -> ! {
             ProbePin::new(peripherals.GPIO44),
             ProbePin::new(peripherals.GPIO48),
         ];
+        // Shared by the shell and payload GPIO calls (see `gpio_probe`).
         match GpioProbe::new(probe_pins, adc_pins) {
             Ok(g) => {
+                gpio_probe::install(g);
                 info!("GPIO probe ready ({} pins)", gpio_probe::COUNT);
-                Some(g)
             }
-            Err(e) => {
-                warn!("GPIO probe setup failed: {}", e);
-                None
-            }
+            Err(e) => warn!("GPIO probe setup failed: {}", e),
         }
-    };
+    }
 
-    match radio::start(&spawner, peripherals.WIFI, peripherals.BT) {
+    match radio::start(spawner, peripherals.WIFI, peripherals.BT) {
         Ok(()) => info!("radio task started"),
         Err(e) => warn!("radio start failed: {}", e),
     }
 
-    match storage::start(&spawner, peripherals.FLASH) {
+    match storage::start(spawner, peripherals.FLASH) {
         Ok(()) => info!("storage task started"),
         Err(e) => warn!("storage start failed: {}", e),
     }
 
-    match wasm::start(&spawner, boot_held) {
+    match wasm::start(spawner, boot_held) {
         Ok(()) => info!("wasm task started"),
         Err(e) => warn!("wasm start failed: {}", e),
     }
 
-    match link_uart::start(&spawner, peripherals.UART1, peripherals.GPIO39, peripherals.GPIO40) {
+    match link_uart::start(spawner, peripherals.UART1, peripherals.GPIO39, peripherals.GPIO40) {
         Ok(()) => info!("link UART ready on GPIO39/40"),
         Err(e) => warn!("link UART start failed: {}", e),
     }
 
-    match serial_link::start(&spawner, peripherals.USB_DEVICE) {
+    match serial_link::start(spawner, peripherals.USB_DEVICE) {
         Ok(()) => info!("serial loader link started"),
         Err(e) => warn!("serial loader link start failed: {}", e),
     }
@@ -221,10 +249,8 @@ async fn main(spawner: Spawner) -> ! {
         leds,
         indicators,
         buttons,
-        #[cfg(feature = "dev")]
-        gpio,
     };
-    shell::run(hw, BoardInfo { mac, firmware: FIRMWARE }).await
+    (hw, BoardInfo { mac, firmware: FIRMWARE })
 }
 
 /// Reads the factory base MAC (the Wi-Fi station address) from eFuse.

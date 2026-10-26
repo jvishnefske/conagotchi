@@ -16,15 +16,17 @@
 //!   [`MAX_ADVERT_PAYLOAD`](super::MAX_ADVERT_PAYLOAD) (21) payload bytes; the
 //!   128-bit service UUID does not fit beside a payload, so these adverts are
 //!   not recognised by `middleware::ble::advert::discover`.
-//! - [`ScanQueue`] implements `middleware::ble::advert::Scanner` over a
-//!   bounded queue of raw reports the firmware's scan callback pushes
-//!   ([`ScanQueue::push`]; when full the oldest report is dropped and
-//!   counted). [`Scanner::try_next_report`] pops one without waiting
-//!   (`Ok(None)` when empty), so a subscriber over it is drained with
-//!   `Subscriber::try_recv` until `Ok(None)`. The queue has no waker, so
-//!   [`Scanner::next_report`] cannot wait either: on an empty queue it
-//!   returns [`ScanQueueError::Empty`]. A report longer than the caller's
-//!   buffer is dropped with [`ScanQueueError::BufferTooSmall`].
+//! - [`ScanQueue`] is middleware's `middleware::ble::advert::ScanQueue`
+//!   (re-exported): a bounded queue of scan reports implementing `Scanner`.
+//!   The firmware's scan callback pushes each report in place through
+//!   `AdvertisingSubscriber::scanner_mut` with the non-consuming
+//!   `ScanQueue::push_report` (when full the oldest report is dropped and
+//!   counted; data over 31 bytes is refused), then drains the subscriber
+//!   with `Subscriber::try_recv` until `Ok(None)`. `Scanner::next_report`
+//!   would wait for a push (the queue keeps a waker); the badge never calls
+//!   it. A report longer than the caller's buffer is dropped with
+//!   [`ScanQueueError::BufferTooSmall`]; subscribers offer [`REPORT_LEN`]
+//!   bytes, so they never see it.
 //! - [`app_subscriber`] builds the middleware `AdvertisingSubscriber` the
 //!   badge uses for wasm app keys ([`AppSubscriber`]): company id
 //!   [`MW_COMPANY_ID`], the filter `KeyFilter::Prefix("app")`, and the
@@ -38,14 +40,13 @@
 //!   sequence in `sample.meta`; repeats are dropped per (sender, key) over
 //!   the [`SENDERS`] most recent pairs.
 
-use heapless::Deque;
+pub use middleware::ble::advert::{ScanQueue, ScanQueueError};
 use middleware::ble::advert::{
-    Address, AdvertisementBuilder, Advertiser, AdvertisingSubscriber, MAX_ADV_DATA, ScanReport,
-    Scanner, ShortIdError,
+    AdvertisementBuilder, Advertiser, AdvertisingSubscriber, MAX_ADV_DATA, ShortIdError,
 };
 use middleware::{Key, KeyFilter};
 
-use super::mux::{AdvBytes, AdvMux, MUX_QUEUE, MuxError};
+use super::mux::{AdvMux, MUX_QUEUE, MuxError};
 use super::{APP_KEY_LEN, MW_COMPANY_ID};
 
 /// Advertising template for middleware publishes (see the module docs).
@@ -106,117 +107,6 @@ impl<const Q: usize> Advertiser for MuxAdvertiser<Q> {
     }
 }
 
-/// Why a [`ScanQueue`] returned no report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanQueueError {
-    /// No report is queued (only from [`Scanner::next_report`]).
-    Empty,
-    /// The caller's buffer is shorter than the queued report (it is dropped).
-    BufferTooSmall,
-}
-
-/// One queued scan report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Raw {
-    address: [u8; 6],
-    rssi: i8,
-    data: AdvBytes,
-}
-
-/// Bounded queue of raw scan reports implementing `Scanner` (see the module
-/// docs). `R` is the capacity.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ScanQueue<const R: usize> {
-    reports: Deque<Raw, R>,
-    dropped: u32,
-}
-
-impl<const R: usize> ScanQueue<R> {
-    /// An empty queue.
-    pub const fn new() -> Self {
-        Self {
-            reports: Deque::new(),
-            dropped: 0,
-        }
-    }
-
-    /// Queues one report heard from `address`. Data longer than 31 bytes is
-    /// counted as dropped; a full queue drops (and counts) its oldest report.
-    pub fn push(self, address: [u8; 6], rssi: i8, data: &[u8]) -> Self {
-        let Ok(data) = AdvBytes::new(data) else {
-            return Self {
-                dropped: self.dropped.wrapping_add(1),
-                ..self
-            };
-        };
-        let mut reports = self.reports;
-        let mut dropped = self.dropped;
-        if reports.is_full() {
-            reports.pop_front();
-            dropped = dropped.wrapping_add(1);
-        }
-        // Cannot fail: a slot was freed above if the queue was full.
-        let _ = reports.push_back(Raw {
-            address,
-            rssi,
-            data,
-        });
-        Self { reports, dropped }
-    }
-
-    /// Reports waiting.
-    pub fn len(&self) -> usize {
-        self.reports.len()
-    }
-
-    /// True if no report is waiting.
-    pub fn is_empty(&self) -> bool {
-        self.reports.is_empty()
-    }
-
-    /// Reports dropped so far (queue full or oversized).
-    pub fn dropped(&self) -> u32 {
-        self.dropped
-    }
-}
-
-impl<const R: usize> ScanQueue<R> {
-    /// Pops the oldest report into `buf`.
-    fn pop<'b>(&mut self, buf: &'b mut [u8]) -> Result<Option<ScanReport<'b>>, ScanQueueError> {
-        let Some(raw) = self.reports.pop_front() else {
-            return Ok(None);
-        };
-        let bytes = raw.data.as_bytes();
-        let out = buf
-            .get_mut(..bytes.len())
-            .ok_or(ScanQueueError::BufferTooSmall)?;
-        out.copy_from_slice(bytes);
-        Ok(Some(ScanReport {
-            address: Address(raw.address),
-            rssi: raw.rssi,
-            data: out,
-        }))
-    }
-}
-
-impl<const R: usize> Scanner for ScanQueue<R> {
-    type Error = ScanQueueError;
-
-    async fn next_report<'b>(
-        &mut self,
-        buf: &'b mut [u8],
-    ) -> Result<ScanReport<'b>, ScanQueueError> {
-        self.pop(buf)?.ok_or(ScanQueueError::Empty)
-    }
-
-    fn try_next_report<'b>(
-        &mut self,
-        buf: &'b mut [u8],
-    ) -> Result<Option<ScanReport<'b>>, ScanQueueError> {
-        self.pop(buf)
-    }
-}
-
 /// The report buffer size a `Scanner` is offered.
 pub const REPORT_LEN: usize = MAX_ADV_DATA;
 
@@ -263,7 +153,10 @@ mod tests {
     use super::*;
     use crate::ble::testutil::block_on;
     use badge_core::io::Millis;
-    use middleware::ble::advert::{AdvertisingError, AdvertisingPublisher, manufacturer_data};
+    use middleware::ble::advert::{
+        Address, AdvertisingError, AdvertisingPublisher, Pushed, ScanReport, Scanner,
+        manufacturer_data,
+    };
     use middleware::ble::uuid::short_id;
     use middleware::{Publisher, SenderId, Subscriber};
 
@@ -284,6 +177,20 @@ mod tests {
             .unwrap()
             .as_bytes()
             .to_vec()
+    }
+
+    /// Pushes one report from `address` into `q` in place.
+    fn push<const R: usize>(
+        q: &mut ScanQueue<R>,
+        address: [u8; 6],
+        rssi: i8,
+        data: &[u8],
+    ) -> Result<Pushed, ScanQueueError> {
+        q.push_report(&ScanReport {
+            address: Address(address),
+            rssi,
+            data,
+        })
     }
 
     /// `(key, payload, sender, seq)` of one received sample.
@@ -343,14 +250,13 @@ mod tests {
 
     #[test]
     fn fr38_scan_queue_is_bounded_and_drops_oldest() {
-        let q = ScanQueue::<2>::new()
-            .push(PEER, -40, &[2, 1, 6])
-            .push(PEER, -41, &[2, 1, 5])
-            .push(PEER, -42, &[2, 1, 4])
-            .push(PEER, -43, &[0; 32]);
+        let mut q = ScanQueue::<2>::new();
+        assert_eq!(push(&mut q, PEER, -40, &[2, 1, 6]), Ok(Pushed::Queued));
+        assert_eq!(push(&mut q, PEER, -41, &[2, 1, 5]), Ok(Pushed::Queued));
+        assert_eq!(push(&mut q, PEER, -42, &[2, 1, 4]), Ok(Pushed::DisplacedOldest));
+        assert_eq!(push(&mut q, PEER, -43, &[0; 32]), Err(ScanQueueError::TooLong));
         assert_eq!(q.len(), 2);
         assert_eq!(q.dropped(), 2);
-        let mut q = q;
         let mut buf = [0u8; REPORT_LEN];
         let r = q.try_next_report(&mut buf).unwrap().unwrap();
         assert_eq!((r.rssi, r.data), (-41, &[2, 1, 5][..]));
@@ -360,12 +266,10 @@ mod tests {
             Err(ScanQueueError::BufferTooSmall)
         );
         assert!(q.is_empty());
+        assert_eq!(q.dropped(), 3);
         assert_eq!(q.try_next_report(&mut buf), Ok(None));
-        assert_eq!(
-            block_on(q.next_report(&mut buf)),
-            Err(ScanQueueError::Empty)
-        );
-        let mut q = q.push(PEER, -44, &[2, 1, 3]);
+        push(&mut q, PEER, -44, &[2, 1, 3]).unwrap();
+        // A report is queued, so `next_report` returns at once.
         let r = block_on(q.next_report(&mut buf)).unwrap();
         assert_eq!((r.address, r.data), (Address(PEER), &[2, 1, 3][..]));
     }
@@ -379,17 +283,17 @@ mod tests {
         }
         // Not learned yet: its adverts cannot be resolved.
         let ad = advert(OTHER, 0, b"x");
-        *s.scanner_mut() = core::mem::take(s.scanner_mut()).push(PEER, -40, &ad);
+        push(s.scanner_mut(), PEER, -40, &ad).unwrap();
         assert!(drain(&mut s).is_empty());
         s.learn(OTHER).unwrap();
         s.learn(OTHER).unwrap();
         assert_eq!(s.keys().len(), KNOWN_APP_KEYS.len() + 1);
-        *s.scanner_mut() = core::mem::take(s.scanner_mut()).push(PEER, -40, &ad);
+        push(s.scanner_mut(), PEER, -40, &ad).unwrap();
         assert_eq!(drain(&mut s).len(), 1);
         // Learned but outside the app prefix: never delivered.
         let sync = Key::from_static("conagotchi/sync");
         s.learn(sync).unwrap();
-        *s.scanner_mut() = core::mem::take(s.scanner_mut()).push(PEER, -40, &advert(sync, 0, b"s"));
+        push(s.scanner_mut(), PEER, -40, &advert(sync, 0, b"s")).unwrap();
         assert!(drain(&mut s).is_empty());
         // The table is bounded.
         for k in ["app/a", "app/b"] {
@@ -407,28 +311,26 @@ mod tests {
     fn fr38_app_subscriber_dedups_per_sender_and_ignores_other_adverts() {
         let mut s = app_subscriber::<8>().unwrap();
         let hello = advert(HELLO, 0, b"hi");
-        let q = s
-            .scanner_mut()
-            .clone()
-            .push(PEER, -40, &hello)
-            .push(PEER, -40, &hello)
+        let foreign = AdvertisementBuilder::new()
+            .company_id(0x0059)
+            .manufacturer_data(&[1, 2, 3])
+            .build()
+            .unwrap();
+        let ho = advert(HELLO, 1, b"ho");
+        let reports: [([u8; 6], &[u8]); 7] = [
+            (PEER, &hello),
+            (PEER, &hello),
             // Another badge also starting at sequence 0 is not a repeat.
-            .push(PEER2, -40, &hello)
-            .push(PEER, -40, &advert(HELLO, 1, b"ho"))
+            (PEER2, &hello),
+            (PEER, &ho),
             // OZ beacon, foreign company, malformed: ignored.
-            .push(PEER, -40, &BEACON)
-            .push(
-                PEER,
-                -40,
-                AdvertisementBuilder::new()
-                    .company_id(0x0059)
-                    .manufacturer_data(&[1, 2, 3])
-                    .build()
-                    .unwrap()
-                    .as_bytes(),
-            )
-            .push(PEER, -40, &[9, 0xFF]);
-        *s.scanner_mut() = q;
+            (PEER, &BEACON),
+            (PEER, foreign.as_bytes()),
+            (PEER, &[9, 0xFF]),
+        ];
+        for (from, ad) in reports {
+            push(s.scanner_mut(), from, -40, ad).unwrap();
+        }
         let got = drain(&mut s);
         let from = |mac| Some(Address(mac).sender());
         assert_eq!(
@@ -457,8 +359,7 @@ mod tests {
         let mut t = 0u64;
         while t < 3_000 {
             p.advertiser_mut().step(Millis(t));
-            let q = core::mem::take(s.scanner_mut()).push(PEER, -50, p.advertiser().mux().on_air());
-            *s.scanner_mut() = q;
+            push(s.scanner_mut(), PEER, -50, p.advertiser().mux().on_air()).unwrap();
             t += 100;
         }
         let got = drain(&mut s);

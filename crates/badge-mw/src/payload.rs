@@ -2,7 +2,8 @@
 //! task and its simulator twin): the payload lifecycle reported in
 //! `WasmStatus`, the boot-time autostart / safe-mode choice, the button
 //! edges delivered to payloads, and the mapping of publish refusals to the
-//! "mw" ABI's error codes.
+//! "mw" ABI's error codes. [`gpio`] holds the pin decisions behind a
+//! payload's `gpio_*` calls (dev builds).
 //!
 //! [`Lifecycle`] is a value type: every transition consumes it and returns
 //! the next one, so the imperative shell only moves it along. Its phase is
@@ -32,6 +33,8 @@ use middleware::loader::PayloadStatus;
 use middleware::wasm_abi::AbiError;
 
 use crate::keys::RouteError;
+
+pub mod gpio;
 
 /// Capacity of `WasmStatus.error` (`badge-proto/build.rs`).
 pub const ERROR_LEN: usize = 48;

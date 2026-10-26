@@ -12,9 +12,9 @@
 //!   for more than one 300 ms middleware slot).
 //! - [`advert`]: [`advert::MuxAdvertiser`], a middleware `Advertiser` that
 //!   hands advertising data to the multiplexer (so the middleware's
-//!   `AdvertisingPublisher` works unchanged); [`advert::ScanQueue`], a
-//!   bounded queue of raw scan reports implementing the middleware `Scanner`
-//!   (`try_next_report` pops without waiting); and [`advert::app_subscriber`],
+//!   `AdvertisingPublisher` works unchanged); [`advert::ScanQueue`],
+//!   middleware's bounded scan report queue (re-exported; filled in place
+//!   with `push_report`, drained without waiting through `try_recv`); and [`advert::app_subscriber`],
 //!   the middleware `AdvertisingSubscriber` over that queue preset for wasm
 //!   app keys (the `app` prefix filter and the [`advert::KNOWN_APP_KEYS`]
 //!   learned in its `ShortIdTable`).

@@ -20,8 +20,17 @@
 //! 7. publishes the `PROBE` block and, every [`HEARTBEAT_MS`], logs a
 //!    heartbeat.
 //!
-//! Each input goes through `let (next, effects) = app.handle(input)`; the
-//! app value lives on this task's stack and is moved linearly, never shared.
+//! Each input goes through `app.step(input, effects)`, the in-place form of
+//! `App::handle`: the app and the one effect buffer live in static cells
+//! built by [`prepare`] (owned by the shell state, never shared), so neither
+//! is copied per input, and the effects are executed by reference straight
+//! out of the buffer.
+//!
+//! Stack: all embassy tasks share the main stack. [`run`]'s future only
+//! awaits the ticker; one tick is the out-of-line `Shell::tick`, so the
+//! tick's temporaries are on the stack only while it runs, not in the frame
+//! of every poll (inlined, they made that frame about 43 KB).
+//!
 //! Effects are executed in order: `Send` → RTT (a button event also goes to
 //! the wasm task, [`wasm::button`], as a `badge/buttons` sample for the
 //! payload; a `WasmLog` event also goes to [`serial_link::log`]; a
@@ -38,12 +47,15 @@
 //! is preserved.
 //!
 //! Hardware that failed to initialise is `None` in [`Hardware`]; the loop
-//! keeps running and the corresponding effects are skipped (GPIO requests are
-//! answered with `UNSUPPORTED`).
+//! keeps running and the corresponding effects are skipped.
 //!
-//! The GPIO probe exists only with the `dev` feature: without it
-//! [`Hardware`] has no `gpio` field and `GpioRead` / `GpioWrite` are always
-//! answered with `UNSUPPORTED` (the core does not emit them in that build).
+//! The GPIO probe exists only with the `dev` feature. It is not part of
+//! [`Hardware`]: it sits in `gpio_probe`'s slot, shared with the wasm
+//! task's payload GPIO calls, and each request borrows it for one
+//! synchronous call (`gpio_probe::with`; no probe answers `UNSUPPORTED`, a
+//! probe in use `BUSY`). Without `dev`, `GpioRead` / `GpioWrite` /
+//! `AdcRead` are always answered with `UNSUPPORTED` (the core does not emit
+//! them in that build).
 
 use badge_core::app::{App, BoardInfo};
 use badge_core::io::{ButtonMask, Effect, Effects, Input, Millis};
@@ -53,11 +65,12 @@ use defmt::{info, warn};
 use embassy_sync::channel::TrySendError;
 use embassy_time::{Duration, Instant, Ticker};
 use heapless::Deque;
+use static_cell::{ConstStaticCell, StaticCell};
 
 use crate::buttons::Buttons;
 use crate::display::Display;
 #[cfg(feature = "dev")]
-use crate::gpio_probe::GpioProbe;
+use crate::gpio_probe;
 use crate::leds::{Indicators, Ws2812};
 use crate::probe::{self, Mailbox, Snapshot};
 use crate::radio::{RADIO_CMDS, RADIO_EVENTS};
@@ -94,9 +107,6 @@ pub struct Hardware {
     pub indicators: Indicators,
     /// Button inputs.
     pub buttons: Buttons,
-    /// GPIO probe pins, if they were set up (`dev` builds only).
-    #[cfg(feature = "dev")]
-    pub gpio: Option<GpioProbe>,
 }
 
 /// Counters for the heartbeat log.
@@ -113,124 +123,179 @@ struct Stats {
     max_tick_us: u64,
 }
 
-/// Shell state that persists across ticks (everything except the app).
-struct Shell {
+/// Shell state that persists across ticks.
+///
+/// The large parts (the 5 KB app, the effect buffer of `MAX_EFFECTS`
+/// effects and the follow-up queue) live in static cells and are only
+/// borrowed here, so neither this value nor the core loop's future copies
+/// them, and building them never happens inside a poll of the loop.
+pub struct Shell {
+    app: &'static mut App,
+    effects: &'static mut Effects,
+    io: Io,
+    last_buttons: ButtonMask,
+    next_heartbeat: u64,
+}
+
+/// The part of the shell that executes effects: drivers, the follow-up
+/// queue, pending renders and counters. Separate from the app and effect
+/// buffer so that effects are executed by reference straight out of the
+/// buffer, without copying each one (an `Effect` is several hundred bytes)
+/// onto the stack.
+struct Io {
     hw: Hardware,
-    followups: Deque<Input, FOLLOWUP_CAP>,
+    followups: &'static mut Deque<Input, FOLLOWUP_CAP>,
     redraw_pending: bool,
     animate_pending: bool,
     stats: Stats,
 }
 
-/// Runs the core loop forever.
-pub async fn run(hw: Hardware, info: BoardInfo) -> ! {
-    let mut shell = Shell { hw, followups: Deque::new(), redraw_pending: false, animate_pending: false, stats: Stats::default() };
-    // The app and one effect buffer live in this task's state (static
-    // memory), and `App::step` updates both in place, so neither the 5 KB
-    // app nor the 10 KB effect vector is copied onto the stack per input.
-    let mut app = App::new(info);
-    let mut effects = Effects::new();
+static SHELL: StaticCell<Shell> = StaticCell::new();
+static APP: StaticCell<App> = StaticCell::new();
+static EFFECTS: ConstStaticCell<Effects> = ConstStaticCell::new(Effects::new());
+static FOLLOWUPS: ConstStaticCell<Deque<Input, FOLLOWUP_CAP>> = ConstStaticCell::new(Deque::new());
+
+/// Builds the shell state in its static cell (the app in its own), out of
+/// line, so that none of it is constructed or copied inside a poll of the
+/// core loop. Call once, before [`run`]; a second call is a startup bug.
+#[inline(never)]
+pub fn prepare(hw: Hardware, info: BoardInfo) -> &'static mut Shell {
+    SHELL.init(Shell::new(hw, info))
+}
+
+/// Runs the core loop forever on the state from [`prepare`].
+///
+/// The future only holds the state reference and the ticker; it awaits the
+/// ticker and calls [`Shell::tick`], which is kept out of line: inlined,
+/// the decoding, input and effect temporaries of one tick were part of the
+/// frame of every poll of this future (about 43 KB of the main stack).
+pub async fn run(shell: &'static mut Shell) -> ! {
     let mut ticker = Ticker::every(Duration::from_millis(TICK_MS));
-    let mut last_buttons = ButtonMask::default();
-    let mut next_heartbeat = HEARTBEAT_MS;
     info!("core loop running, tick {} ms", TICK_MS);
     loop {
         ticker.next().await;
+        shell.tick();
+    }
+}
+
+impl Shell {
+    /// Builds the shell state; the app is constructed in its static cell
+    /// here, out of line of the core loop's poll.
+    #[inline(never)]
+    fn new(hw: Hardware, info: BoardInfo) -> Self {
+        Shell {
+            // `run` is called once (from `main`), so each cell is
+            // initialised once: a second call is a startup bug.
+            app: APP.init_with(|| App::new(info)),
+            effects: EFFECTS.take(),
+            io: Io {
+                hw,
+                followups: FOLLOWUPS.take(),
+                redraw_pending: false,
+                animate_pending: false,
+                stats: Stats::default(),
+            },
+            last_buttons: ButtonMask::default(),
+            next_heartbeat: HEARTBEAT_MS,
+        }
+    }
+
+    /// One core loop tick (steps 1 to 7 of the module docs).
+    #[inline(never)]
+    fn tick(&mut self) {
         let start = Instant::now();
         let now = Millis(start.as_millis());
 
-        let buttons = shell.hw.buttons.sample();
-        if buttons != last_buttons {
+        let buttons = self.io.hw.buttons.sample();
+        if buttons != self.last_buttons {
             info!("buttons raw {=u8:#07b}", buttons.0);
-            last_buttons = buttons;
+            self.last_buttons = buttons;
         }
-        shell.feed(&mut app, &mut effects, Input::Tick { now, buttons });
+        self.feed(Input::Tick { now, buttons });
 
         for _ in 0..MAX_HOST_PER_TICK {
-            match shell.hw.link.next_input() {
-                Some(input) => shell.feed(&mut app, &mut effects, input),
+            match self.io.hw.link.next_input() {
+                Some(input) => self.feed(input),
                 None => break,
             }
         }
 
         for _ in 0..MAX_RADIO_PER_TICK {
             match RADIO_EVENTS.try_receive() {
-                Ok(input) => shell.feed(&mut app, &mut effects, input),
+                Ok(input) => self.feed(input),
                 Err(_) => break,
             }
         }
 
         for _ in 0..MAX_WASM_PER_TICK {
             match wasm::try_next() {
-                Some(input) => shell.feed(&mut app, &mut effects, input),
+                Some(input) => self.feed(input),
                 None => break,
             }
         }
 
         if let Some(input) = serial_link::try_next() {
-            shell.feed(&mut app, &mut effects, input);
+            self.feed(input);
         }
 
         match probe::take_mailbox() {
             Mailbox::Empty => {}
-            Mailbox::Command(msg) => shell.feed(&mut app, &mut effects, Input::Host(msg)),
+            Mailbox::Command(msg) => self.feed(Input::Host(msg)),
             Mailbox::Unknown(cmd) => warn!("PROBE mailbox: unknown command {}", cmd),
         }
 
         for _ in 0..MAX_FOLLOWUPS_PER_TICK {
-            match shell.followups.pop_front() {
-                Some(input) => shell.feed(&mut app, &mut effects, input),
+            match self.io.followups.pop_front() {
+                Some(input) => self.feed(input),
                 None => break,
             }
         }
 
-        shell.flush_redraw(&app);
-        probe::publish(&snapshot(&app));
+        self.io.flush_redraw(self.app);
+        probe::publish(&snapshot(self.app));
 
-        shell.stats.ticks = shell.stats.ticks.wrapping_add(1);
+        self.io.stats.ticks = self.io.stats.ticks.wrapping_add(1);
         let elapsed = start.elapsed().as_micros();
-        shell.stats.max_tick_us = shell.stats.max_tick_us.max(elapsed);
-        if now.0 >= next_heartbeat {
-            next_heartbeat = now.0.saturating_add(HEARTBEAT_MS);
-            shell.heartbeat(&app);
+        self.io.stats.max_tick_us = self.io.stats.max_tick_us.max(elapsed);
+        if now.0 >= self.next_heartbeat {
+            self.next_heartbeat = now.0.saturating_add(HEARTBEAT_MS);
+            self.io.heartbeat(self.app);
+        }
+    }
+
+    /// Feeds one input to the app and executes the resulting effects.
+    fn feed(&mut self, input: Input) {
+        self.app.step(input, self.effects);
+        // In order, by reference: no effect is copied out of the buffer.
+        for effect in self.effects.iter() {
+            self.io.execute(effect, self.app);
         }
     }
 }
 
-impl Shell {
-    /// Feeds one input to the app and executes the resulting effects.
-    fn feed(&mut self, app: &mut App, effects: &mut Effects, input: Input) {
-        app.step(input, effects);
-        // One effect at a time is cloned out of the buffer, in order.
-        for i in 0..effects.len() {
-            if let Some(effect) = effects.get(i).cloned() {
-                self.execute(effect, app);
-            }
-        }
-    }
-
-    /// Carries out one effect.
-    fn execute(&mut self, effect: Effect, app: &App) {
+impl Io {
+    /// Carries out one effect; `app` is the state after the input.
+    fn execute(&mut self, effect: &Effect, app: &App) {
         match effect {
             Effect::Send(msg) => {
-                if let Some((seq, answer)) = badge_mw::serial::serial_answer(&msg) {
+                if let Some((seq, answer)) = badge_mw::serial::serial_answer(msg) {
                     serial_link::answer(seq, answer);
                     return;
                 }
-                if let Some(text) = badge_mw::serial::wasm_log(&msg) {
+                if let Some(text) = badge_mw::serial::wasm_log(msg) {
                     serial_link::log(text);
                 }
-                if let Some((button, pressed)) = badge_mw::payload::button_edge(&msg) {
+                if let Some((button, pressed)) = badge_mw::payload::button_edge(msg) {
                     wasm::button(button, pressed);
                 }
-                if let Err(e) = self.hw.link.send(&msg) {
+                if let Err(e) = self.hw.link.send(msg) {
                     self.stats.send_errors = self.stats.send_errors.wrapping_add(1);
                     warn!("proto-up send failed: {}", e);
                 }
             }
             // Scan results are built from the next state here, so the large
             // lists never travel inside an `Effect`.
-            Effect::SendScan { seq, kind } => {
+            &Effect::SendScan { seq, kind } => {
                 if let Err(e) = self.hw.link.send(&app.scan_response(kind, seq)) {
                     self.stats.send_errors = self.stats.send_errors.wrapping_add(1);
                     warn!("proto-up send failed: {}", e);
@@ -238,16 +303,16 @@ impl Shell {
             }
             Effect::Leds(colors) => {
                 if let Some(leds) = self.hw.leds.as_mut()
-                    && let Err(e) = leds.write(&colors)
+                    && let Err(e) = leds.write(colors)
                 {
                     self.stats.led_errors = self.stats.led_errors.wrapping_add(1);
                     warn!("WS2812 write failed: {}", e);
                 }
             }
-            Effect::Indicator(which, on) => self.hw.indicators.set(which, on),
+            &Effect::Indicator(which, on) => self.hw.indicators.set(which, on),
             Effect::Redraw => self.redraw_pending = true,
             Effect::Animate => self.animate_pending = true,
-            Effect::Draw(op) => {
+            &Effect::Draw(op) => {
                 self.flush_redraw(app);
                 if let Some(display) = self.hw.display.as_mut()
                     && let Err(e) = display.draw(op)
@@ -257,37 +322,28 @@ impl Shell {
                 }
             }
             #[cfg(feature = "dev")]
-            Effect::GpioRead { seq, pin } => {
-                let result = match self.hw.gpio.as_mut() {
-                    Some(gpio) => gpio.read(pin),
-                    None => Err(ErrorCode::Unsupported),
-                };
+            &Effect::GpioRead { seq, pin } => {
+                let result = gpio_probe::with(|gpio| gpio.read(pin)).unwrap_or_else(|e| Err(e.error_code()));
                 self.follow_up(Input::Gpio { seq, pin, result });
             }
             #[cfg(feature = "dev")]
-            Effect::GpioWrite { seq, pin, level } => {
-                let result = match self.hw.gpio.as_mut() {
-                    Some(gpio) => gpio.write(pin, level),
-                    None => Err(ErrorCode::Unsupported),
-                };
+            &Effect::GpioWrite { seq, pin, level } => {
+                let result = gpio_probe::with(|gpio| gpio.write(pin, level)).unwrap_or_else(|e| Err(e.error_code()));
                 self.follow_up(Input::Gpio { seq, pin, result });
             }
             #[cfg(feature = "dev")]
-            Effect::AdcRead { seq, pin, samples } => {
-                let result = match self.hw.gpio.as_mut() {
-                    Some(gpio) => gpio.adc_read(pin, samples),
-                    None => Err(ErrorCode::Unsupported),
-                };
+            &Effect::AdcRead { seq, pin, samples } => {
+                let result = gpio_probe::with(|gpio| gpio.adc_read(pin, samples)).unwrap_or_else(|e| Err(e.error_code()));
                 self.follow_up(Input::Adc { seq, result });
             }
             // No probe pins without `dev` (the core never asks then anyway).
             #[cfg(not(feature = "dev"))]
-            Effect::GpioRead { seq, pin } | Effect::GpioWrite { seq, pin, .. } => {
+            &(Effect::GpioRead { seq, pin } | Effect::GpioWrite { seq, pin, .. }) => {
                 let result = Err(ErrorCode::Unsupported);
                 self.follow_up(Input::Gpio { seq, pin, result });
             }
             #[cfg(not(feature = "dev"))]
-            Effect::AdcRead { seq, .. } => {
+            &Effect::AdcRead { seq, .. } => {
                 self.follow_up(Input::Adc { seq, result: Err(ErrorCode::Unsupported) });
             }
             radio @ (Effect::WifiScan { .. }
@@ -297,20 +353,20 @@ impl Shell {
             | Effect::BleAdvertise { .. }
             | Effect::Beacon(_)
             | Effect::SyncBroadcast { .. }) => {
-                if let Err(TrySendError::Full(rejected)) = RADIO_CMDS.try_send(radio) {
+                if let Err(TrySendError::Full(rejected)) = RADIO_CMDS.try_send(radio.clone()) {
                     self.stats.radio_busy = self.stats.radio_busy.wrapping_add(1);
                     if let Some(reply) = radio_error(&rejected, ErrorCode::Busy) {
                         self.follow_up(reply);
                     }
                 }
             }
-            Effect::LinkSend(frame) => link_uart::send(frame),
-            Effect::SaveContact(contact) => storage::submit(StorageCmd::Save(contact)),
+            Effect::LinkSend(frame) => link_uart::send(frame.clone()),
+            Effect::SaveContact(contact) => storage::submit(StorageCmd::Save(contact.clone())),
             Effect::ClearContacts => storage::submit(StorageCmd::Clear),
             // The wasm task answers on its own queue (drained below); a
             // full command queue is answered BUSY here.
             Effect::Wasm { seq, cmd } => {
-                if let Some(busy) = wasm::submit(seq, cmd) {
+                if let Some(busy) = wasm::submit(*seq, cmd.clone()) {
                     self.follow_up(busy);
                 }
             }

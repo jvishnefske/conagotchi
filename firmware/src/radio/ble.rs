@@ -2,7 +2,11 @@
 //! air-metrics collector and the GATT service "Conagotchi", using the
 //! trouble-host stack over esp-radio's HCI connector.
 //!
-//! The task owns the BLE host. The host runner and the command loop run
+//! The task owns the BLE host. Its `Send` long-lived state (the
+//! [`Collector`], the GATT server and the RPC channels) is built once by
+//! [`prepare`] in static cells, out of line at boot, so the task future
+//! holds only references to it; the host resources and stack are not
+//! `Send` and stay in the future. The host runner and the command loop run
 //! concurrently inside the task (`select`); advertising reports reach the
 //! command loop through a [`Collector`] that the runner calls for every HCI
 //! advertising-report event. All decisions are made by pure badge-core code
@@ -42,8 +46,9 @@
 //! payloads up to 21 bytes. A payload too large or a full queue drops the
 //! message (counted). The key is also learned by the app subscriber below.
 //!
-//! Every scan report that is not an OZ beacon is pushed into the
-//! `badge_mw::ble::advert::ScanQueue` of the middleware's
+//! Every scan report that is not an OZ beacon is pushed in place
+//! (`ScanQueue::push_report`) into the middleware `ScanQueue` (re-exported
+//! as `badge_mw::ble::advert::ScanQueue`) of the middleware's
 //! `AdvertisingSubscriber` (built by `badge_mw::ble::advert::app_subscriber`:
 //! company id `0xFFFF`, filter `Prefix("app")`), which is then drained with
 //! `try_recv` inside the runner's callback. Its `ShortIdTable` maps the
@@ -128,6 +133,7 @@ use badge_mw::ble::rpc::{
     self as mw_rpc, BadgeHandler, BadgeSnapshot, RpcEvent, RpcIo, RpcServer, SnapshotSource,
 };
 use badge_mw::ble::{APP_KEY_LEN, AdvertisingPublisher, AttMtu, MAX_ADVERT_PAYLOAD};
+use middleware::ble::advert::{Address, ScanReport};
 use badge_mw::keys::app_may_use;
 use badge_mw::{Key, Publisher, Responder, Subscriber};
 use badge_proto::{BleDevice, ErrorCode};
@@ -138,6 +144,7 @@ use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use esp_radio::ble::controller::BleConnector;
 use heapless::{String, Vec};
+use static_cell::{ConstStaticCell, StaticCell};
 use trouble_host::prelude::*;
 
 use super::RADIO_EVENTS;
@@ -276,9 +283,9 @@ struct BadgeService {
 
 /// Sees every advertising report (called by the host runner).
 ///
-/// Lives on the BLE task's stack and is shared by reference between the
-/// runner and the command loop. Both run in the same task and no borrow is
-/// held across an await.
+/// Lives in a static cell ([`prepare`]) and is shared by reference between
+/// the runner and the command loop. Both run in the same task and no borrow
+/// is held across an await.
 struct Collector {
     metrics: RefCell<BleMetrics>,
     forward: RefCell<ForwardFilter>,
@@ -347,8 +354,13 @@ impl Collector {
         let Ok(mut sub) = self.app_sub.try_borrow_mut() else {
             return;
         };
-        let queue = core::mem::take(sub.scanner_mut()).push(report.addr, report.rssi, report.data);
-        *sub.scanner_mut() = queue;
+        // Too-long data is refused and a full queue drops its oldest report;
+        // both are counted by the queue, so the result needs no handling.
+        let _ = sub.scanner_mut().push_report(&ScanReport {
+            address: Address(report.addr),
+            rssi: report.rssi,
+            data: report.data,
+        });
         let mut buf = [0u8; APP_SAMPLE_BUF];
         // Every `try_recv` consumes at least one queued report, so this
         // drains the queue.
@@ -468,33 +480,58 @@ impl EventHandler for Collector {
     }
 }
 
-/// Owns the BLE host and serves [`BLE_CMDS`] forever.
-#[embassy_executor::task]
-pub async fn ble_task(controller: BleController) {
-    let mut resources: HostResources<
-        BleController,
-        DefaultPacketPool,
-        CONNECTIONS_MAX,
-        L2CAP_CHANNELS_MAX,
-    > = HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources).build();
-    let mut runner = stack.runner();
-    let collector = Collector::new();
+/// The host resources the BLE stack is built on.
+type Resources = HostResources<BleController, DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX>;
+
+static COLLECTOR: ConstStaticCell<Collector> = ConstStaticCell::new(Collector::new());
+static SERVER: StaticCell<Server<'static>> = StaticCell::new();
+static RPC_RX: ConstStaticCell<RpcRx> = ConstStaticCell::new(RpcRx::new());
+static RPC_TX: ConstStaticCell<RpcTx> = ConstStaticCell::new(RpcTx::new());
+
+/// The BLE task's long-lived state that can live in static cells (it is
+/// `Send`), built once by [`prepare`]. The host resources and stack are not
+/// `Send`, so they stay in the task future.
+pub struct BleParts {
+    controller: BleController,
+    collector: &'static Collector,
+    server: Option<&'static Server<'static>>,
+    rpc_rx: &'static RpcRx,
+    rpc_tx: &'static RpcTx,
+}
+
+/// Builds the BLE host over `controller` and the task's state in their
+/// static cells. Synchronous and out of line, so the construction
+/// temporaries live in this boot-time frame only.
+///
+/// Returns `None` if called more than once (the cells are already taken).
+#[inline(never)]
+pub fn prepare(controller: BleController) -> Option<BleParts> {
+    let collector = COLLECTOR.try_take()?;
+    let rpc_rx = RPC_RX.try_take()?;
+    let rpc_tx = RPC_TX.try_take()?;
     collector.load_known_keys();
-    let rpc_rx = RpcRx::new();
-    let rpc_tx = RpcTx::new();
     let server = match Server::new_default(DEFAULT_NAME) {
-        Ok(server) => Some(server),
+        Ok(server) => SERVER.try_init(server).map(|s| &*s),
         Err(e) => {
             warn!("ble: GATT server unavailable: {}", e);
             None
         }
     };
+    Some(BleParts { controller, collector, server, rpc_rx, rpc_tx })
+}
+
+/// Owns the BLE host and serves [`BLE_CMDS`] forever.
+#[embassy_executor::task]
+pub async fn ble_task(parts: BleParts) {
+    let BleParts { controller, collector, server, rpc_rx, rpc_tx } = parts;
+    let mut resources = Resources::new();
+    let stack = trouble_host::new(controller, &mut resources).build();
+    let mut runner = stack.runner();
 
     if let Either3::First(result) = select3(
-        runner.run_with_handler(&collector),
-        serve(&stack, &collector, server.as_ref(), &rpc_rx, &rpc_tx),
-        rpc_loop(&rpc_rx, &rpc_tx),
+        runner.run_with_handler(collector),
+        serve(&stack, collector, server, rpc_rx, rpc_tx),
+        rpc_loop(rpc_rx, rpc_tx),
     )
     .await
     {
@@ -1164,3 +1201,4 @@ async fn start_advertising<'d>(
     info!("ble: advertising");
     Ok(handle)
 }
+

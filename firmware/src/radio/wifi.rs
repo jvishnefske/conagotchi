@@ -232,7 +232,12 @@ impl EspNowRadio for EspNowLink {
 }
 
 /// The middleware transport over ESP-NOW used by this task.
-type Transport = EspNowTransport<'static, EspNowLink, DEDUP_ENTRIES, { FILTERS.len() }>;
+///
+/// `P = 0`: no kept-frame slot (saves about `MAX_FRAME` bytes of the task
+/// future). Every receive passes an [`RX_BUF`] buffer, which holds any
+/// sample, so `BufferTooSmall` (the only case a kept frame serves) cannot
+/// happen.
+type Transport = EspNowTransport<'static, EspNowLink, DEDUP_ENTRIES, { FILTERS.len() }, 0>;
 
 /// One receive outcome of the transport, borrowing the sample buffer.
 type RxResult<'b> = Result<Sample<'b>, MwError<LinkError>>;

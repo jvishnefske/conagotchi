@@ -115,10 +115,11 @@ pub fn start(
     let connector =
         BleConnector::new(bt, esp_radio::ble::Config::default()).map_err(RadioError::BleInit)?;
     let ble_controller: ble::BleController = ExternalController::new(connector);
+    let ble_parts = ble::prepare(ble_controller).ok_or(RadioError::AlreadyStarted)?;
 
     spawner.spawn(net_task(runner).map_err(|_| RadioError::Spawn)?);
     spawner.spawn(wifi::wifi_task(controller, stack).map_err(|_| RadioError::Spawn)?);
-    spawner.spawn(ble::ble_task(ble_controller).map_err(|_| RadioError::Spawn)?);
+    spawner.spawn(ble::ble_task(ble_parts).map_err(|_| RadioError::Spawn)?);
     spawner.spawn(dispatch_task().map_err(|_| RadioError::Spawn)?);
     Ok(())
 }

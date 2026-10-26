@@ -349,3 +349,25 @@ pub enum ScanKind {
 
 /// Effects produced by one `App::handle` call, in execution order.
 pub type Effects = Vec<Effect, MAX_EFFECTS>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::size_of;
+
+    /// `Effect` and `Input` are queued and copied by value on the MCU stack
+    /// (`MAX_EFFECTS` per input), so their size is a stack budget. Today the
+    /// largest variants are the scan lists: `Send` of a `WifiScanResult`
+    /// (`MAX_APS` access points) and `WifiScanned`; next come the wasm chunk
+    /// (`WasmCmd::Write`, `WASM_CHUNK` bytes) and `HostMsg`. Sizes are for the
+    /// host (64-bit `usize`); on the Xtensa target both are 736 B.
+    #[test]
+    fn effect_and_input_size_budget() {
+        assert!(size_of::<Effect>() <= 888, "Effect grew to {}", size_of::<Effect>());
+        assert!(size_of::<Input>() <= 888, "Input grew to {}", size_of::<Input>());
+        // The scan lists dominate; the wasm chunk is the next bound.
+        let scan = size_of::<badge_proto::WifiScanResult>();
+        assert!(scan > size_of::<WasmCmd>() && scan > size_of::<badge_proto::HostMsg>());
+        assert!(size_of::<Vec<AccessPoint, MAX_APS>>() > size_of::<Vec<BleDevice, MAX_BLE>>());
+    }
+}
