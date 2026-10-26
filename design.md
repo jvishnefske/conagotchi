@@ -129,7 +129,7 @@ Flash layout: `firmware/partitions.csv` is the stock table with the unused otada
   - `badgectl wasm load apps/hello.wasm` stored the 5935 B image (Begin/Chunk/Commit) and `wasm start` printed "hello from wasm".
   - It ticks every ~100 ms with the 20 ms core loop holding 50 ticks/s; the longest call is ~50–64 ms (first-call compilation in `init`).
   - Heap is ~37 KB free with the payload running.
-  - The main stack peak was measured at ~53.5 KB (painted stack), so the wasm heap region is 16 KiB, leaving ~64.7 KB of stack.
+  - The main stack peak was measured at ~53.5 KB (painted stack), so the wasm heap region was cut to 16 KiB. FR-46 found the cause and raised it to 28 KiB.
 - [x] FR-41 An uploaded payload is persisted in the `payload` partition (0x1E0000, 128 KiB, carved from the factory slot, which is now 0x1D0000). It autostarts on boot unless SELECT is held while the badge boots, so holding SELECT is a safe mode. BOOT can't serve here: it is GPIO0, a strapping pin, and holding it through a reset enters the ROM download mode. — `fr39_payload_persists_across_sim_restart`, `fr39_payload_store_follows_erase_write_activate`. — hw: the payload autostarts after a reset and after a reflash; a reset with SELECT held leaves it installed and STOPPED, and `wasm start` resumes it. The partition change kept the radio key and storage.
 - [x] FR-42 Payloads reach badge features through keys:
   - `badge/leds` (24 bytes) sets the LEDs;
@@ -153,6 +153,27 @@ Flash layout: `firmware/partitions.csv` is the stock table with the unused otada
     - it published `app/hello` every 2 s (500 sends, 0 failures);
     - the badge's payload logged `rx 8266156`..`rx 8266264` (106 of 109 counter values, about 3% lost on air).
   - Observed once and not reproduced: before a reflash the badge's RTT control block was found overwritten, and RTT was lost while the firmware kept running. Stack painting in three later runs (payload restart, first `on_message`, 3-minute soak) stayed under 24.6 KB with the block intact.
+
+### Serial loader, Blocks editor and stack budget
+- [x] FR-44 The badge serves middleware's serial loader protocol on its USB-Serial-JTAG CDC port (`/dev/ttyACM0`), so `mwctl` and the middleware web app install and run payloads as on an esp-base board, while RTT over probe-rs keeps working on the same USB device. `sys/info` reports chip `esp32s3-conagotchi`, the wasm-host ABI version, capacity and payload state. `sys/loader/begin|chunk|commit` and `sys/payload/start|stop` map onto the core's `WasmBegin`/`WasmChunk`/`WasmCommit`/`WasmStart`/`WasmStop` with seqs from `probe_layout::SERIAL_SEQ`, whose responses are routed back to the link and never to RTT. Payload logs go out on `sys/log` and state changes on `sys/payload/status`. Host publishes reach the payload only on `app/...` keys. `WasmChunk.data` is 512 B (= `loader::CHUNK_MAX`). — `fr44_*` (badge-mw `serial`, `probe_layout`). hw 2026-10-25 (`mwctl` 0.3 against the badge):
+  - `info`, `upload apps/hello.wasm --start` (5935 B, 0.70 s, about 40 ms per chunk), `stop`, `start` and `monitor` (`sys/log` lines) all work.
+  - A host publish on `app/hello` comes back as the payload's `rx N` log; a publish on `badge/leds` is dropped; an unknown `sys/` key is answered NotFound.
+  - 20 publishes over 20 s while `badgectl info` ran over RTT: all 20 echoed, and RTT answered 4/4.
+  - Soak 2026-10-26: 44 upload/stop/start cycles over two 10-minute runs, all OK.
+  - Open: opening `/dev/ttyACM0` right after a probe-rs session can take ~5 s, and probe-rs occasionally fails to open the probe ("transfer was cancelled") while the CDC port carries traffic.
+- [ ] FR-45 The middleware web app's Blocks tab (Blockly) builds a payload for the badge profile (`set LEDs`, `show text`, `pet mode`, `on button`), compiles it to AssemblyScript with 1-byte pages (16 KiB), simulates it, and uploads it over Web Serial to the badge, where it runs and persists across a reset. — middleware `web/test/blocks*.test.ts` (U9–U12: generator goldens, compile and ABI check of every example, simulator runs including `badge/leds` from the LED chase).
+  - Pending: the upload in real Chrome over Web Serial to the badge.
+- [x] FR-46 Main-stack budget. Every embassy task shares the one main stack (`.stack`: the RAM left after `.data`, `.bss` and the heap regions). The deepest call chain of any task, plus the executor and interrupt frames, stays at least 20 KB below `.stack`, with `wasm::HEAP_BYTES` ≥ 24 KiB (it is 28 KiB). Tools:
+  - `badgectl stack paint|report` paints the unused stack below SP with probe-rs and reports the high-water mark, using bounds from esp-hal's `_stack_end_cpu0`/`_stack_start_cpu0` and the `__stack_chk_guard` word;
+  - `badgectl rtt-check` validates the `_SEGGER_RTT` control block and the guard;
+  - `scripts/stack-watermark.sh` runs paint, then a soak, then the report, with periodic RTT checks;
+  - `scripts/stack-report.py <elf>` gives each task's deepest static chain from the `entry`/`movsp` frame sizes.
+  Evidence — `badgectl` `stack::tests::*`, `rtt_check::tests::*`, `io::tests::effect_and_input_size_budget`:
+  - **Before** (hw 2026-10-25, f095e8f, `.stack` 57,168 B): a 10-minute soak of 24 serial upload/stop/start cycles, with ESP-NOW and BLE running, peaked at **54,512 B (2.6 KB margin)**. Statically, `shell::run` had been inlined into `main`'s future, so every poll of the core loop reserved a 43,344 B frame.
+  - **After** (hw 2026-10-26, `.stack` 46,192 B, heap 28 KiB): the core loop runs out of line from static cells, the BLE task is built in place (no 9.3 KB spawn copy), and ESP-NOW uses `P = 0`. The deepest static chains are core loop 16,240 B, wasm 15,920 B, storage 10,816 B, wifi 7,856 B and ble 7,424 B. A 10-minute soak of 20 serial upload/stop/start cycles plus Wi-Fi and BLE scans over RTT peaked at **12,816 B (33,312 B margin)**.
+- RTT block corruption hunt (FR-43 note): not reproduced. Across the two 10-minute soaks, `rtt-check` ran every 30 s, and all 34 checks that opened the probe found the block and the stack guard intact. The 8 other runs failed only to open the probe while a concurrent `badgectl` scan held it. The one-off was most likely the main-stack overflow risk that FR-46 removed (2.6 KB margin before).
+- [ ] FR-47 In `dev` builds a payload's `gpio_output` / `gpio_input` / `gpio_write` / `gpio_read` drive the probe pins (`board::PROBE_PINS`; other pins are `Unsupported`). The pins are handed off per call through the shell's single `GpioProbe` owner, so host `GpioRead`/`GpioWrite` keep working; release builds refuse. — `payload_gpio_*` (badge-mw `payload::gpio`).
+  - Pending: hardware run on a dev build.
 
 ## Middleware validation findings (2026-10-24; gaps 1–9 fixed upstream in middleware 0.2, see its CHANGELOG)
 
