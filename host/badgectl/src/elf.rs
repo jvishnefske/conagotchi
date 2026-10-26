@@ -5,6 +5,9 @@
 //! `::PROBE` ([`matches_probe_symbol`]). `_SEGGER_RTT` is the unmangled RTT
 //! control block. Selection over `(demangled name, address)` pairs is the
 //! pure [`select_symbols`]; [`symbols_from_elf`] feeds it from an ELF image.
+//! [`symbol_table`] returns every named symbol of any kind (including the
+//! linker script's absolute symbols such as `_stack_start_cpu0`) for
+//! `crate::stack`.
 
 use object::{Object, ObjectSymbol, SymbolKind};
 
@@ -82,6 +85,16 @@ pub fn symbols_from_elf(bytes: &[u8]) -> Result<Symbols, ElfError> {
     select_symbols(named.iter().map(|(n, a)| (n.as_str(), *a)))
 }
 
+/// Every named symbol of an ELF image as `(demangled name, address)`,
+/// whatever its kind (data, text or linker-script absolute).
+pub fn symbol_table(bytes: &[u8]) -> Result<Vec<(String, u64)>, ElfError> {
+    let file = object::File::parse(bytes).map_err(|e| ElfError::Parse(e.to_string()))?;
+    Ok(file
+        .symbols()
+        .filter_map(|s| s.name().ok().filter(|n| !n.is_empty()).map(|n| (demangle(n), s.address())))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +146,6 @@ mod tests {
     #[test]
     fn garbage_is_not_an_elf() {
         assert!(matches!(symbols_from_elf(b"not an elf at all"), Err(ElfError::Parse(_))));
+        assert!(matches!(symbol_table(b"not an elf at all"), Err(ElfError::Parse(_))));
     }
 }

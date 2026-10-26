@@ -9,7 +9,9 @@
 //!    [`RADIO_EVENTS`];
 //!    then up to [`MAX_WASM_PER_TICK`] inputs from the wasm task
 //!    ([`wasm::try_next`]: command answers, payload logs, payload badge
-//!    commands);
+//!    commands), then at most one request from the USB serial loader link
+//!    ([`serial_link::try_next`], `Input::Host` with a seq in
+//!    `probe_layout::SERIAL_SEQ`);
 //! 4. takes a pending `PROBE` mailbox command as `Input::Host`;
 //! 5. feeds follow-up inputs produced while executing effects (GPIO results,
 //!    `BUSY` answers when the radio queue is full), bounded per tick;
@@ -22,7 +24,9 @@
 //! app value lives on this task's stack and is moved linearly, never shared.
 //! Effects are executed in order: `Send` → RTT (a button event also goes to
 //! the wasm task, [`wasm::button`], as a `badge/buttons` sample for the
-//! payload), `Leds` → RMT,
+//! payload; a `WasmLog` event also goes to [`serial_link::log`]; a
+//! `Response` whose seq is in `SERIAL_SEQ` goes only to
+//! [`serial_link::answer`], never to RTT), `Leds` → RMT,
 //! `Indicator` → GPIO, `Draw` → panel, `GpioRead`/`GpioWrite` → probe pins
 //! with the result fed back, radio effects → [`RADIO_CMDS`], `LinkSend` →
 //! [`link_uart::send`], `SaveContact`/`ClearContacts` → [`storage::submit`]
@@ -61,6 +65,7 @@ use crate::rtt::HostLink;
 use crate::storage::{self, StorageCmd};
 use crate::wasm;
 use crate::link_uart;
+use crate::serial_link;
 
 /// Core loop period.
 pub const TICK_MS: u64 = 20;
@@ -162,6 +167,10 @@ pub async fn run(hw: Hardware, info: BoardInfo) -> ! {
             }
         }
 
+        if let Some(input) = serial_link::try_next() {
+            shell.feed(&mut app, &mut effects, input);
+        }
+
         match probe::take_mailbox() {
             Mailbox::Empty => {}
             Mailbox::Command(msg) => shell.feed(&mut app, &mut effects, Input::Host(msg)),
@@ -204,6 +213,13 @@ impl Shell {
     fn execute(&mut self, effect: Effect, app: &App) {
         match effect {
             Effect::Send(msg) => {
+                if let Some((seq, answer)) = badge_mw::serial::serial_answer(&msg) {
+                    serial_link::answer(seq, answer);
+                    return;
+                }
+                if let Some(text) = badge_mw::serial::wasm_log(&msg) {
+                    serial_link::log(text);
+                }
                 if let Some((button, pressed)) = badge_mw::payload::button_edge(&msg) {
                     wasm::button(button, pressed);
                 }

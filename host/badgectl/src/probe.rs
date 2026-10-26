@@ -8,6 +8,12 @@
 //! channel 0 carries defmt logs. Flashing uses the esp-idf image format from
 //! `probe-rs-espressif`, as `probe-rs run` does for ESP chips, with the
 //! firmware's partition table.
+//!
+//! [`read_bytes`], [`read_words`], [`write_words`], [`sample_sp`] and
+//! [`with_core_halted`] are the raw memory and core access behind
+//! `badgectl stack` and `badgectl rtt-check`. Only [`sample_sp`] and
+//! [`with_core_halted`] halt core 0, and both resume it (if it was running)
+//! whatever the outcome.
 
 use std::path::Path;
 use std::time::Duration;
@@ -64,6 +70,63 @@ pub fn flash(session: &mut Session, elf: &Path, partition_table: Option<&Path>) 
         .with_context(|| format!("flashing {} failed", elf.display()))?;
     session.core(0)?.reset().context("reset after flashing failed")?;
     Ok(())
+}
+
+/// Halt timeout for SP sampling and halted painting.
+const HALT_TIMEOUT: Duration = Duration::from_millis(200);
+/// Pause between SP samples that landed outside the wanted stack.
+const SP_RETRY_PAUSE: Duration = Duration::from_millis(20);
+
+/// Reads `out.len()` bytes at `addr` from core 0's view of memory.
+pub fn read_bytes(session: &mut Session, addr: u64, out: &mut [u8]) -> Result<()> {
+    session.core(0)?.read_8(addr, out).with_context(|| format!("reading {} bytes at {addr:#010x}", out.len()))
+}
+
+/// Reads `out.len()` words at `addr`.
+pub fn read_words(session: &mut Session, addr: u64, out: &mut [u32]) -> Result<()> {
+    session.core(0)?.read_32(addr, out).with_context(|| format!("reading {} words at {addr:#010x}", out.len()))
+}
+
+/// Writes `words` at `addr`.
+pub fn write_words(session: &mut Session, addr: u64, words: &[u32]) -> Result<()> {
+    session.core(0)?.write_32(addr, words).with_context(|| format!("writing {} words at {addr:#010x}", words.len()))
+}
+
+/// Runs `f` with core 0 halted, then resumes it if it was running before,
+/// even when `f` fails. `f` receives the halted SP.
+pub fn with_core_halted<T>(session: &mut Session, f: impl FnOnce(&mut Session, u64) -> Result<T>) -> Result<T> {
+    let was_halted = session.core(0)?.core_halted()?;
+    if !was_halted {
+        session.core(0)?.halt(HALT_TIMEOUT).context("halting core 0")?;
+    }
+    let result = (|| {
+        let mut core = session.core(0)?;
+        let sp_reg = core.stack_pointer().id();
+        let sp: u32 = core.read_core_reg(sp_reg).context("reading SP")?;
+        drop(core);
+        f(session, u64::from(sp))
+    })();
+    if !was_halted {
+        session.core(0)?.run().context("resuming core 0")?;
+    }
+    result
+}
+
+/// Samples core 0's SP by halting it briefly, up to `attempts` times until
+/// `accept(sp)` holds (e.g. SP inside the main stack rather than an
+/// esp-rtos thread stack). Returns the last SP and whether it was accepted.
+pub fn sample_sp(session: &mut Session, attempts: usize, accept: impl Fn(u64) -> bool) -> Result<(u64, bool)> {
+    let mut last = 0;
+    for i in 0..attempts.max(1) {
+        if i > 0 {
+            std::thread::sleep(SP_RETRY_PAUSE);
+        }
+        last = with_core_halted(session, |_, sp| Ok(sp))?;
+        if accept(last) {
+            return Ok((last, true));
+        }
+    }
+    Ok((last, false))
 }
 
 /// Resolved RTT channels.

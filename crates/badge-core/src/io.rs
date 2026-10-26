@@ -159,8 +159,11 @@ pub const MAX_ADC_SAMPLES: u32 = 64;
 
 /// Longest wasm log line carried through the core.
 pub const WASM_LOG_LEN: usize = 64;
-/// Largest wasm upload chunk (matches `WasmLoad.data`).
-pub const WASM_CHUNK: usize = 192;
+/// Largest wasm upload chunk: `WasmChunk.data`'s bound, equal to
+/// `middleware::loader::CHUNK_MAX` so a `sys/loader/chunk` from the serial
+/// loader maps onto one `WasmChunk` unchanged.
+pub const WASM_CHUNK: usize = 512;
+const _: () = assert!(WASM_CHUNK == middleware::loader::CHUNK_MAX);
 
 /// A payload command, executed by the firmware's wasm task (or the
 /// simulator) and answered with exactly one [`Input::Wasm`]. The upload

@@ -19,13 +19,16 @@
 //!    key, first-boot import of the stock key, the `payload` partition), the
 //!    wasm payload task ([`wasm::start`]: autostarts the installed payload
 //!    unless in safe mode, without delaying the boot) and the link UART
-//!    tasks ([`link_uart::start`]);
+//!    tasks ([`link_uart::start`]), and the USB serial loader link
+//!    ([`serial_link::start`]: middleware's serial protocol on the
+//!    USB-Serial-JTAG CDC port, next to RTT on its JTAG side);
 //! 6. the core loop, with [`BoardInfo`] built from the eFuse base MAC and the
 //!    crate name and version.
 //!
 //! Modules: [`rtt`] (transport), [`buttons`], [`leds`], [`display`],
 //! `gpio_probe` (`dev` feature only), [`probe`] (debugger status block),
-//! [`radio`], [`storage`], [`wasm`], [`link_uart`], [`shell`].
+//! [`radio`], [`storage`], [`wasm`], [`link_uart`], [`serial_link`],
+//! [`shell`].
 //!
 //! Without the `dev` feature the GPIO probe module is compiled out and its 17
 //! pins are never claimed, so they stay unconfigured (reset state).
@@ -49,6 +52,7 @@ mod mw;
 mod probe;
 mod radio;
 mod rtt;
+mod serial_link;
 mod shell;
 mod storage;
 mod wasm;
@@ -73,8 +77,10 @@ extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-/// Firmware identification reported by `GetInfo`.
+/// Firmware identification reported by `GetInfo` and serial `sys/info`
+/// (at most `middleware::loader::MAX_NAME`, 32 bytes).
 const FIRMWARE: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"));
+const _: () = assert!(FIRMWARE.len() <= middleware::loader::MAX_NAME);
 
 static HOST_LINK: StaticCell<HostLink> = StaticCell::new();
 static DISPLAY_BUFFER: ConstStaticCell<[u8; display::BUFFER_LEN]> =
@@ -202,6 +208,11 @@ async fn main(spawner: Spawner) -> ! {
     match link_uart::start(&spawner, peripherals.UART1, peripherals.GPIO39, peripherals.GPIO40) {
         Ok(()) => info!("link UART ready on GPIO39/40"),
         Err(e) => warn!("link UART start failed: {}", e),
+    }
+
+    match serial_link::start(&spawner, peripherals.USB_DEVICE) {
+        Ok(()) => info!("serial loader link started"),
+        Err(e) => warn!("serial loader link start failed: {}", e),
     }
 
     let hw = Hardware {

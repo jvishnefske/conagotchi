@@ -394,27 +394,32 @@ mod tests {
 
     #[test]
     fn wasm_plan_is_begin_chunks_commit() {
-        let module: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        // Five full chunks and a partial sixth.
+        let len = 5 * WASM_CHUNK + 40;
+        let module: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
         let plan = wasm_plan(&module).unwrap();
         assert_eq!(plan.len(), 1 + 6 + 1);
         let crc32 = middleware::crc::Crc32::checksum(&module);
-        assert_eq!(plan[0], Cmd::WasmBegin(WasmBegin { len: 1000, crc32 }));
+        assert_eq!(plan[0], Cmd::WasmBegin(WasmBegin { len: len as u32, crc32 }));
         assert_eq!(plan[7], Cmd::WasmCommit(WasmCommit {}));
         assert!(plan[1..7].iter().all(|c| matches!(c, Cmd::WasmChunk(_))));
         let chunks = chunks(&plan);
         for (i, (offset, _)) in chunks.iter().enumerate() {
             assert_eq!(*offset as usize, i * WASM_CHUNK);
         }
-        assert!(chunks[..5].iter().all(|(_, d)| d.len() == 192));
-        assert_eq!(chunks[5].1.len(), 1000 - 5 * 192, "last chunk is partial");
+        assert!(chunks[..5].iter().all(|(_, d)| d.len() == WASM_CHUNK));
+        assert_eq!(chunks[5].1.len(), 40, "last chunk is partial");
         let joined: Vec<u8> = chunks.iter().flat_map(|(_, d)| d.iter().copied()).collect();
         assert_eq!(joined, module);
     }
 
     #[test]
     fn wasm_plan_exact_and_single_byte_modules() {
-        let exact = chunks(&wasm_plan(&[7; 384]).unwrap());
-        assert_eq!((exact.len(), exact[1].0, exact[1].1.len()), (2, 192, 192));
+        let exact = chunks(&wasm_plan(&vec![7; 2 * WASM_CHUNK]).unwrap());
+        assert_eq!(
+            (exact.len(), exact[1].0 as usize, exact[1].1.len()),
+            (2, WASM_CHUNK, WASM_CHUNK)
+        );
         let one = wasm_plan(&[1]).unwrap();
         assert_eq!(one.len(), 3);
         assert_eq!(chunks(&one), vec![(0, vec![1])]);
@@ -432,7 +437,10 @@ mod tests {
     fn wasm_modules_over_16k_or_empty_are_refused_locally() {
         assert_eq!(WASM_MAX_MODULE, 16 * 1024);
         assert_eq!(wasm_plan(&[]), Err(RequestError::EmptyModule));
-        assert_eq!(wasm_plan(&vec![0; 16 * 1024]).map(|c| c.len()), Ok(86 + 2));
+        assert_eq!(
+            wasm_plan(&vec![0; 16 * 1024]).map(|c| c.len()),
+            Ok((16 * 1024usize).div_ceil(WASM_CHUNK) + 2)
+        );
         assert_eq!(
             wasm_plan(&vec![0; 16 * 1024 + 1]),
             Err(RequestError::ModuleTooLarge { len: 16 * 1024 + 1, max: 16 * 1024 })

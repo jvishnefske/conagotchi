@@ -228,7 +228,7 @@ message WasmBegin {
 
 message WasmChunk {
   uint32 offset = 1;
-  bytes data = 2;    // up to 192 bytes
+  bytes data = 2;    // up to 512 bytes (middleware::loader::CHUNK_MAX)
 }
 
 message WasmCommit {}

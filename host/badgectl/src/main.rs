@@ -1,8 +1,8 @@
 //! `badgectl`: host CLI for the Conagotchi discovery firmware.
 //!
 //! Functional core: [`color`], [`request`], [`format`](mod@format), [`peek`], [`elf`],
-//! the [`session`] state machine and the [`adopt`] flow are pure and
-//! unit-tested against in-memory fakes. Imperative shell: [`probe`]
+//! [`stack`], [`rtt_check`], the [`session`] state machine and the [`adopt`]
+//! flow are pure and unit-tested against in-memory fakes. Imperative shell: [`probe`]
 //! (probe-rs attach, RTT, flashing), [`badge_io`] (probe-rs + espflash
 //! hardware for `adopt` / `restore`), [`logs`] (defmt decoding and printing)
 //! and this file (argument dispatch, Ctrl-C, exit codes).
@@ -11,7 +11,14 @@
 //! request command talks to badge `n` of a fresh simulation through the
 //! same [`session::Conn`] request path as RTT.
 //!
-//! Exit codes: 0 success, 1 error response or failure, 2 timeout.
+//! `badgectl stack paint` / `stack report` measure the main stack's
+//! high-water mark by painting it over the debug link ([`stack`] has the
+//! method and the symbols used), and `badgectl rtt-check` validates the
+//! `_SEGGER_RTT` control block and the stack guard word ([`rtt_check`]).
+//! `scripts/stack-watermark.sh` wraps them for soak runs.
+//!
+//! Exit codes: 0 success, 1 error response or failure (also: stack not
+//! painted, stack guard changed, RTT block corrupt), 2 timeout.
 
 mod adopt;
 mod badge_io;
@@ -23,8 +30,10 @@ mod logs;
 mod peek;
 mod probe;
 mod request;
+mod rtt_check;
 mod session;
 mod sim;
+mod stack;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -34,7 +43,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use cli::{AdoptArgs, Cli, Command, RequestCmd};
+use cli::{AdoptArgs, Cli, Command, PaintArgs, RequestCmd, StackCmd};
 use logs::{DefmtInfo, Printer};
 use peek::ProbeBlock;
 use probe::ProbeLink;
@@ -158,6 +167,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Monitor | Command::Events => {
             let session = probe::attach(&cli.chip, cli.probe.as_deref())?;
             stream(&cli, fw.as_ref(), session, cli.timeout)
+        }
+        Command::Stack { op } => {
+            let fw = fw.ok_or_else(|| anyhow!("`stack` needs the firmware ELF (--elf)"))?;
+            let regions = stack_regions(&fw)?;
+            let mut session = probe::attach(&cli.chip, cli.probe.as_deref())?;
+            warn_if_other_build(&mut session, &fw);
+            match op {
+                StackCmd::Paint(args) => stack_paint(&cli, &mut session, &regions, args),
+                StackCmd::Report { pattern, painted_top } => {
+                    stack_report(&cli, &mut session, &regions, *pattern, *painted_top)
+                }
+            }
+        }
+        Command::RttCheck { addr } => {
+            let addr = addr
+                .or_else(|| fw.as_ref().and_then(|f| f.symbols.rtt))
+                .ok_or_else(|| anyhow!("_SEGGER_RTT address unknown: pass --elf with the firmware or --addr 0x..."))?;
+            let regions = match &fw {
+                Some(f) => stack_regions(f).ok(),
+                None => None,
+            };
+            let mut session = probe::attach(&cli.chip, cli.probe.as_deref())?;
+            if let Some(f) = &fw {
+                warn_if_other_build(&mut session, f);
+            }
+            rtt_check_cmd(&cli, &mut session, addr, regions.as_deref())
         }
         Command::Adopt(args) => run_adopt(&cli, fw.as_ref(), args),
         Command::Restore { backup } => run_restore(&cli, backup),
@@ -473,6 +508,196 @@ fn stream(cli: &Cli, fw: Option<&Firmware>, session: probe_rs::Session, wait_ms:
     eprintln!("streaming; Ctrl-C to stop");
     conn.stream(&mut printer, || STOP.load(Ordering::SeqCst))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Attempts at sampling an SP inside the main stack (esp-rtos may be
+/// running a thread with a heap-allocated stack when the core halts).
+const SP_ATTEMPTS: usize = 5;
+/// Words written per probe-rs call while painting.
+const PAINT_CHUNK_WORDS: usize = 1024;
+
+/// Warns on stderr when the ELF's `PROBE` address does not hold the PROBE
+/// magic: the badge then runs a different build, and every address taken
+/// from the ELF (stack bounds, `_SEGGER_RTT`) is suspect.
+fn warn_if_other_build(session: &mut probe_rs::Session, fw: &Firmware) {
+    let Some(base) = fw.symbols.probe else { return };
+    let addr = base + badge_core::probe_layout::MAGIC as u64 * 4;
+    let mut w = [0u32; 1];
+    match probe::read_words(session, addr, &mut w) {
+        Ok(()) if w[0] == badge_core::probe_layout::MAGIC_VALUE => {}
+        Ok(()) => eprintln!(
+            "warning: no PROBE magic at {addr:#010x} ({:#010x}): the badge is probably running a different build \
+             than {}; pass the flashed ELF with --elf",
+            w[0],
+            fw.path.display()
+        ),
+        Err(e) => eprintln!("warning: cannot read the PROBE magic: {e:#}"),
+    }
+}
+
+/// Stack regions of the firmware image (CPU 0 first).
+fn stack_regions(fw: &Firmware) -> Result<Vec<stack::StackRegion>> {
+    let table = elf::symbol_table(&fw.bytes).with_context(|| format!("symbols of {}", fw.path.display()))?;
+    Ok(stack::regions_from_symbols(table.iter().map(|(n, a)| (n.as_str(), *a)))?)
+}
+
+/// Writes `plan` with `pattern`, bottom (coldest) first.
+fn write_paint(session: &mut probe_rs::Session, plan: &stack::PaintPlan, pattern: u32) -> Result<()> {
+    let chunk = vec![pattern; PAINT_CHUNK_WORDS];
+    let mut addr = plan.start;
+    let mut left = plan.words();
+    while left > 0 {
+        let n = left.min(PAINT_CHUNK_WORDS);
+        probe::write_words(session, addr, chunk.get(..n).unwrap_or(&chunk))?;
+        addr += n as u64 * 4;
+        left -= n;
+    }
+    Ok(())
+}
+
+/// `stack paint`: paints CPU 0's main stack below SP minus the margin (or
+/// below `--top`).
+fn stack_paint(
+    cli: &Cli,
+    session: &mut probe_rs::Session,
+    regions: &[stack::StackRegion],
+    args: &PaintArgs,
+) -> Result<ExitCode> {
+    let region = regions.first().ok_or(stack::StackError::NoStackSymbols)?;
+    let paint = |session: &mut probe_rs::Session, limit: u64| -> Result<stack::PaintPlan> {
+        let plan = stack::plan_paint(region, limit)?;
+        if !args.dry_run {
+            write_paint(session, &plan, args.pattern)?;
+        }
+        Ok(plan)
+    };
+    let (plan, sp) = match (args.top, args.halt) {
+        (Some(top), _) => (paint(session, top)?, None),
+        (None, true) => probe::with_core_halted(session, |s, sp| {
+            let limit = stack::paint_limit(region, sp, args.margin)?;
+            Ok((paint(s, limit)?, Some(sp)))
+        })?,
+        (None, false) => {
+            let (sp, ok) = probe::sample_sp(session, SP_ATTEMPTS, |sp| region.contains_sp(sp))?;
+            if !ok {
+                return Err(stack::StackError::SpOutside { sp, bottom: region.bottom(), top: region.top() }.into());
+            }
+            let limit = stack::paint_limit(region, sp, args.margin)?;
+            (paint(session, limit)?, Some(sp))
+        }
+    };
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "region": region.name(), "start": plan.start, "end": plan.end, "bytes": plan.len(),
+                "pattern": args.pattern, "sp": sp, "margin": args.margin, "halted": args.halt,
+                "dry_run": args.dry_run,
+            })
+        );
+    } else {
+        let mut line = stack::paint_summary(region, &plan, args.pattern, sp, args.margin);
+        if args.dry_run {
+            line = line.replacen("painted", "would paint", 1);
+        }
+        println!("{line}");
+        println!("next: badgectl stack report --painted-top {:#010x}", plan.end);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Reads the guard word of `region`, if it has one.
+fn read_guard(session: &mut probe_rs::Session, region: &stack::StackRegion) -> Result<stack::Guard> {
+    let Some(addr) = region.guard() else { return Ok(stack::Guard::Absent) };
+    let mut w = [0u32; 1];
+    probe::read_words(session, addr, &mut w)?;
+    Ok(stack::guard_state(Some(addr), Some(w[0])))
+}
+
+/// `stack report`: scans every region from its paintable bottom upward.
+fn stack_report(
+    cli: &Cli,
+    session: &mut probe_rs::Session,
+    regions: &[stack::StackRegion],
+    pattern: u32,
+    painted_top: Option<u64>,
+) -> Result<ExitCode> {
+    let mut alarm = false;
+    for (i, region) in regions.iter().enumerate() {
+        let base = region.paintable_bottom();
+        let count = usize::try_from((region.top() - base) / 4)?;
+        let mut words = vec![0u32; count];
+        probe::read_words(session, base, &mut words)?;
+        let report = stack::StackReport {
+            region: region.clone(),
+            watermark: stack::find_watermark(base, &words, pattern),
+            pattern,
+            // `stack paint` only paints CPU 0.
+            painted_top: painted_top.filter(|_| i == 0),
+            guard: read_guard(session, region)?,
+        };
+        alarm |= report.is_alarm();
+        if cli.json {
+            println!("{}", report.to_json());
+        } else {
+            println!("{}", report.render());
+        }
+    }
+    Ok(if alarm { ExitCode::from(1) } else { ExitCode::SUCCESS })
+}
+
+/// `rtt-check`: reads and validates the control block, its channel names
+/// and the CPU 0 stack guard word.
+fn rtt_check_cmd(
+    cli: &Cli,
+    session: &mut probe_rs::Session,
+    addr: u64,
+    regions: Option<&[stack::StackRegion]>,
+) -> Result<ExitCode> {
+    let map = &rtt_check::ESP32S3;
+    let len = usize::try_from(map.ram.end.saturating_sub(addr))?.clamp(rtt_check::HEADER_LEN, rtt_check::READ_LEN);
+    let mut bytes = vec![0u8; len];
+    probe::read_bytes(session, addr, &mut bytes)?;
+    let block = rtt_check::ControlBlock::parse(&bytes)?;
+    let mut read_name = |ptr: u32| -> Option<String> {
+        let p = u64::from(ptr);
+        if !(map.ram.contains(&p) || map.rodata.contains(&p)) {
+            return None;
+        }
+        let mut buf = [0u8; rtt_check::NAME_MAX];
+        probe::read_bytes(session, p, &mut buf).ok()?;
+        rtt_check::c_name(&buf)
+    };
+    let names = rtt_check::Names {
+        up: block.up.iter().map(|c| read_name(c.name_ptr)).collect(),
+        down: block.down.iter().map(|c| read_name(c.name_ptr)).collect(),
+    };
+    let findings = rtt_check::check(&block, addr, map, Some(&rtt_check::FIRMWARE_LAYOUT), &names);
+    let guard = match regions.and_then(|r| r.first()) {
+        Some(region) => read_guard(session, region)?,
+        None => stack::Guard::Absent,
+    };
+    let guard_bad = matches!(guard, stack::Guard::Changed { .. });
+    if cli.json {
+        let mut j = rtt_check::to_json(&block, addr, &names, &findings);
+        j["stack_guard"] = match guard {
+            stack::Guard::Absent => serde_json::Value::Null,
+            stack::Guard::Intact(a) => serde_json::json!({ "addr": a, "ok": true }),
+            stack::Guard::Changed { addr, value } => serde_json::json!({ "addr": addr, "ok": false, "value": value }),
+        };
+        println!("{j}");
+    } else {
+        println!("{}", rtt_check::render(&block, addr, &names, &findings));
+        match guard {
+            stack::Guard::Absent => println!("stack guard    unknown (no ELF or no __stack_chk_guard)"),
+            stack::Guard::Intact(a) => println!("stack guard    {a:#010x} = {:#010x} (ok)", stack::GUARD_VALUE),
+            stack::Guard::Changed { addr, value } => println!(
+                "stack guard    {addr:#010x} = {value:#010x} (CHANGED, expected {:#010x})",
+                stack::GUARD_VALUE
+            ),
+        }
+    }
+    Ok(if rtt_check::is_corrupt(&findings) || guard_bad { ExitCode::from(1) } else { ExitCode::SUCCESS })
 }
 
 /// Process-specific entropy for the first sequence number.

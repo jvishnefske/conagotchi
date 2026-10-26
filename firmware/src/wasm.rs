@@ -77,6 +77,10 @@
 //! - the ABI 2 calls (IRQs, timers, SPI, UART) keep wasm-host's
 //!   `Unsupported` defaults.
 //!
+//! Every payload phase change (`Lifecycle::phase`) is offered to the USB
+//! serial link ([`serial_link::status`], `sys/payload/status`); the link
+//! drops it if its queue is full.
+//!
 //! Inputs for the core go through a bounded event queue that the shell
 //! drains with [`try_next`]; a full queue drops the input and counts it,
 //! and the count is logged every [`REPORT_MS`] while it grows, with the
@@ -122,6 +126,7 @@ use middleware::Key;
 use wasm_host::{AbiError, Device, Limits, Payload, Pull};
 
 use crate::mw::{self, MwMessage};
+use crate::serial_link;
 use crate::storage::{self, PayloadDone, PayloadError, PayloadOp};
 
 /// The payload's resource limits: `board::PAYLOAD_MAX_MEMORY` and
@@ -319,10 +324,16 @@ impl Runner {
         self.life.status(PAYLOAD_MAX_IMAGE)
     }
 
-    /// Moves the lifecycle on with `f`.
+    /// Moves the lifecycle on with `f`; a phase change is offered to the
+    /// USB serial link as `sys/payload/status`.
     fn update(&mut self, f: impl FnOnce(Lifecycle) -> Lifecycle) {
+        let before = self.life.phase();
         let life = core::mem::replace(&mut self.life, Lifecycle::boot(None));
         self.life = f(life);
+        let after = self.life.phase();
+        if after != before {
+            serial_link::status(after);
+        }
     }
 
     /// A flash operation failed: no trusted image remains.

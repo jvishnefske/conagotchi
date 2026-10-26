@@ -99,6 +99,19 @@ pub const GATT_SEQ: u32 = 0xFFFF_FFFE;
 /// (`set_leds`, `show_text`, `set_pet`). Their responses go to RTT too.
 pub const WASM_SEQ: u32 = 0xFFFF_FFFD;
 
+/// Sequence numbers the USB serial loader (middleware's serial protocol on
+/// the USB-Serial-JTAG CDC port) uses for the host messages it feeds the
+/// core. The shell routes responses whose seq falls in this range back to
+/// the serial link instead of RTT, so RTT hosts (whose seqs count up from
+/// small values) and the serial link never see each other's answers. The
+/// serial link hands out seqs from the range in turn, wrapping.
+pub const SERIAL_SEQ: core::ops::Range<u32> = 0xFF00_0000..0xFFFF_0000;
+
+/// True if `seq` belongs to the USB serial loader ([`SERIAL_SEQ`]).
+pub const fn is_serial_seq(seq: u32) -> bool {
+    seq >= SERIAL_SEQ.start && seq < SERIAL_SEQ.end
+}
+
 /// Converts a mailbox command into the equivalent host message.
 ///
 /// Returns `None` for an empty (0) or unknown command, which the firmware
@@ -126,6 +139,16 @@ pub fn mailbox_to_host_msg(cmd: u32, arg0: u32, arg1: u32) -> Option<HostMsg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fr44_serial_seqs_are_disjoint_from_the_reserved_seqs() {
+        assert!(is_serial_seq(SERIAL_SEQ.start));
+        assert!(is_serial_seq(SERIAL_SEQ.end - 1));
+        assert!(!is_serial_seq(SERIAL_SEQ.end));
+        for seq in [0, 1, 0x00FF_FFFF, MAILBOX_SEQ, GATT_SEQ, WASM_SEQ] {
+            assert!(!is_serial_seq(seq), "{seq:#x}");
+        }
+    }
 
     #[test]
     fn offsets_are_contiguous_and_in_bounds() {

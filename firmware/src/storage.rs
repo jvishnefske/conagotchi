@@ -13,7 +13,7 @@
 //! own synchronous duration, so the borrows never overlap (a failed borrow
 //! would surface as `FlashStorageError::IoError`, never as a panic). The
 //! wasm task reaches the payload partition through [`payload`], a request /
-//! reply pair over this task's command queue.
+//! reply pair over this task's one-slot payload queue.
 //!
 //! Layout (`partitions.csv`): `conag` is the stock `otadata` slot,
 //! 0x200000..0x202000 (two 4 KiB sectors), holding a `sequential-storage`
@@ -33,8 +33,9 @@
 //! 4. serves commands forever: `Save` stores one contact (a new id into a
 //!    full store first deletes the contact saved longest ago,
 //!    `store::SaveOrder`), `Clear` deletes every stored contact and keeps
-//!    the key, and `Payload` runs one [`PayloadOp`] for the wasm task and
-//!    answers it on a one-slot reply queue.
+//!    the key, and a [`PayloadOp`] from the wasm task (its own one-slot
+//!    queue, so the eight contact command slots stay small) is run and
+//!    answered on a one-slot reply queue.
 //!
 //! # Payload partition
 //!
@@ -61,7 +62,7 @@
 //! executor between commands and between the deletions of a `Clear`, but a
 //! sector erase (tens of ms) still stalls everything while it runs; a
 //! payload `Erase` of a 16 KiB image erases five sectors in one call. The
-//! wasm task's [`payload`] waits for room in the queue instead (it has
+//! wasm task's [`payload`] waits for room in its queue instead (it has
 //! nothing else to do until the answer arrives).
 //!
 //! Every loop is bounded ([`MAX_ITEMS`] stored items, `MAX_CONTACTS`
@@ -82,6 +83,7 @@ use badge_core::store::{self, Loader, SaveOrder};
 use defmt::{info, warn};
 use embassy_embedded_hal::adapter::BlockingAsync;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embedded_storage::nor_flash::{ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash};
@@ -110,8 +112,6 @@ pub enum StorageCmd {
     Save(Contact),
     /// Delete every stored contact (the radio key stays).
     Clear,
-    /// A payload partition operation; answered through [`payload`].
-    Payload(PayloadOp),
 }
 
 /// An operation on the `payload` partition (see the module docs).
@@ -184,16 +184,19 @@ pub enum StorageError {
 }
 
 static CMDS: Channel<CriticalSectionRawMutex, StorageCmd, QUEUE> = Channel::new();
-/// Answers to [`StorageCmd::Payload`]; one request is outstanding at a time
-/// (only the wasm task sends them, and it waits for each answer).
+/// Payload partition operations; one is outstanding at a time (only the
+/// wasm task sends them, and it waits for each answer). Separate from
+/// [`CMDS`] so that queue's slots are not sized for a 512-byte chunk.
+static PAYLOAD_OPS: Channel<CriticalSectionRawMutex, PayloadOp, 1> = Channel::new();
+/// Answers to [`PAYLOAD_OPS`].
 static PAYLOAD_REPLIES: Channel<CriticalSectionRawMutex, PayloadReply, 1> = Channel::new();
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 
 /// Runs one payload partition operation and waits for its answer. Waits
-/// for room in the command queue, and until the boot load (contacts, key
+/// for room in the payload queue, and until the boot load (contacts, key
 /// import) has finished. Only the wasm task may call this.
 pub async fn payload(op: PayloadOp) -> PayloadReply {
-    CMDS.send(StorageCmd::Payload(op)).await;
+    PAYLOAD_OPS.send(op).await;
     PAYLOAD_REPLIES.receive().await
 }
 
@@ -373,18 +376,18 @@ async fn storage_task(flash: FlashStorage<'static>) {
     };
     let mut order = order;
     loop {
-        match CMDS.receive().await {
-            StorageCmd::Save(contact) => {
+        match select(CMDS.receive(), PAYLOAD_OPS.receive()).await {
+            Either::First(StorageCmd::Save(contact)) => {
                 if let Some(map) = map.as_mut() {
                     order = save(map, buf, order, &contact).await;
                 }
             }
-            StorageCmd::Clear => {
+            Either::First(StorageCmd::Clear) => {
                 if let Some(map) = map.as_mut() {
                     order = clear(map, buf, order).await;
                 }
             }
-            StorageCmd::Payload(op) => {
+            Either::Second(op) => {
                 let reply = match store.as_mut() {
                     Some(store) => payload_op(store, op),
                     None => Err(PayloadError::Unavailable),

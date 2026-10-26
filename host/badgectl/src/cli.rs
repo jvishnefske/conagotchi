@@ -85,9 +85,67 @@ pub enum Command {
     /// Run simulated badges (the badge core as wasm) talking over a
     /// middleware bus.
     Sim(SimArgs),
+    /// Main stack high-water mark by painting (bounds from the ELF's
+    /// `_stack_end_cpu0` / `_stack_start_cpu0` / `__stack_chk_guard`).
+    Stack {
+        /// Operation.
+        #[command(subcommand)]
+        op: StackCmd,
+    },
+    /// Validate the `_SEGGER_RTT` control block and the stack guard word
+    /// (read only); exit 1 if a field is corrupt.
+    RttCheck {
+        /// Control block address (default: `_SEGGER_RTT` from the ELF).
+        #[arg(long, value_parser = parse_u64)]
+        addr: Option<u64>,
+    },
     /// Protocol requests sent over RTT.
     #[command(flatten)]
     Request(RequestCmd),
+}
+
+/// `stack` operations.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum StackCmd {
+    /// Fill the unused part of the main stack (above the guard word, below
+    /// SP minus `--margin`) with `--pattern`. SP is sampled by halting core
+    /// 0 for a moment unless `--top` is given; the paint itself runs with
+    /// the core running unless `--halt`.
+    Paint(PaintArgs),
+    /// Read the stack back and print the high-water mark and margin
+    /// (read only, no halt). Exit 1 if the stack is not painted or the
+    /// guard word changed.
+    Report {
+        /// Paint word to look for.
+        #[arg(long, value_parser = parse_u32, default_value = crate::stack::DEFAULT_PATTERN_ARG)]
+        pattern: u32,
+        /// Top of the last paint (printed by `stack paint`); lets the report
+        /// tell "never reached the paint" from a real watermark.
+        #[arg(long, value_parser = parse_u64)]
+        painted_top: Option<u64>,
+    },
+}
+
+/// Options of `stack paint`.
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
+pub struct PaintArgs {
+    /// Bytes kept unpainted below the sampled SP (room for the stack to
+    /// grow while the paint is written).
+    #[arg(long, default_value_t = crate::stack::DEFAULT_MARGIN)]
+    pub margin: u64,
+    /// Paint word.
+    #[arg(long, value_parser = parse_u32, default_value = crate::stack::DEFAULT_PATTERN_ARG)]
+    pub pattern: u32,
+    /// Paint below this address instead of SP minus margin (no halt).
+    #[arg(long, value_parser = parse_u64, conflicts_with = "halt")]
+    pub top: Option<u64>,
+    /// Keep core 0 halted while painting (no race with stack growth, but
+    /// the radios stall for the duration).
+    #[arg(long)]
+    pub halt: bool,
+    /// Print the plan without writing (still samples SP unless `--top`).
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// Options of `sim`.
@@ -299,7 +357,7 @@ pub enum AdcCmd {
 /// `wasm` operations.
 #[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum WasmOp {
-    /// Install a module (`WasmBegin` with its length and CRC-32, 192-byte
+    /// Install a module (`WasmBegin` with its length and CRC-32, 512-byte
     /// `WasmChunk`s in order, `WasmCommit`), then print the payload status.
     Load {
         /// The `.wasm` file (1 byte to 16 KiB).
@@ -552,6 +610,12 @@ pub fn parse_peer_id(input: &str) -> Result<PeerId, String> {
         .map_err(|_| format!("invalid peer id `{input}`: expected 6 hex digits like 0AC8F6"))
 }
 
+/// Parses a decimal or `0x`-prefixed hexadecimal 32-bit word.
+pub fn parse_u32(input: &str) -> Result<u32, String> {
+    let v = parse_u64(input)?;
+    u32::try_from(v).map_err(|_| format!("`{input}` does not fit in 32 bits"))
+}
+
 /// Parses a decimal or `0x`-prefixed hexadecimal address.
 pub fn parse_u64(input: &str) -> Result<u64, String> {
     let t = input.trim();
@@ -747,6 +811,30 @@ mod tests {
         assert_eq!(a.zenoh, ["tcp/127.0.0.1:7447"]);
         let cli = Cli::try_parse_from(["badgectl", "--sim", "1", "lobby"]).unwrap();
         assert_eq!((cli.sim, cli.sim_badges, cli.sim_warmup_ms), (Some(1), 2, 3000));
+    }
+
+    #[test]
+    fn stack_and_rtt_check_parse() {
+        let Ok(Command::Stack { op: StackCmd::Paint(p) }) = parse(&["stack", "paint"]) else { panic!("paint") };
+        assert_eq!(
+            p,
+            PaintArgs { margin: 16 * 1024, pattern: 0xa5a5_a5a5, top: None, halt: false, dry_run: false }
+        );
+        let Ok(Command::Stack { op: StackCmd::Paint(p) }) =
+            parse(&["stack", "paint", "--margin", "4096", "--pattern", "0x12345678", "--top", "0x3fcd0000", "--dry-run"])
+        else {
+            panic!("paint opts")
+        };
+        assert_eq!((p.margin, p.pattern, p.top, p.dry_run), (4096, 0x1234_5678, Some(0x3fcd_0000), true));
+        assert!(parse(&["stack", "paint", "--top", "0x1000", "--halt"]).is_err());
+        assert!(parse(&["stack", "paint", "--pattern", "0x100000000"]).is_err());
+        assert!(matches!(
+            parse(&["stack", "report", "--painted-top", "0x3fcd4000"]),
+            Ok(Command::Stack { op: StackCmd::Report { pattern: 0xa5a5_a5a5, painted_top: Some(0x3fcd_4000) } })
+        ));
+        assert!(parse(&["stack"]).is_err());
+        assert!(matches!(parse(&["rtt-check"]), Ok(Command::RttCheck { addr: None })));
+        assert!(matches!(parse(&["rtt-check", "--addr", "0x3fcc8cf4"]), Ok(Command::RttCheck { addr: Some(0x3fcc_8cf4) })));
     }
 
     #[test]

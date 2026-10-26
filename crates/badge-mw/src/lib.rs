@@ -21,6 +21,9 @@
 //!
 //! - [`keys`]: the keys badges publish on and the `badge/*` routing of wasm
 //!   payload publishes (shared by firmware, simulator and wasm apps).
+//! - [`serial`]: middleware's serial loader protocol (`sys/info`,
+//!   `sys/loader/*`, `sys/payload/*`) mapped onto the core's wasm commands,
+//!   for the firmware's USB CDC link.
 //! - [`ble`]: the advertising multiplexer that time-shares the badge's one
 //!   advertising set with the stock OZ trade beacon, the `Advertiser` and
 //!   `Scanner` adapters over it, the app-key subscriber preset, and the GATT
@@ -36,6 +39,7 @@
 pub mod ble;
 pub mod keys;
 pub mod payload;
+pub mod serial;
 
 /// The middleware ESP-NOW transport (`espnow` feature), re-exported so the
 /// firmware needs no direct `middleware` dependency.
