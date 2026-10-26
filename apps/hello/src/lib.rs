@@ -13,13 +13,12 @@
 //! Failures (a full subscription table, a refused publish) are logged, never
 //! fatal. Built by `scripts/build-apps.sh` into `apps/hello.wasm`.
 //!
-//! The logic is in `app` under `#![forbid(unsafe_code)]`. The crate root is
-//! only `deny(unsafe_code)`: `mw_payload::payload!` expands to the five ABI
-//! exports with `#[allow(unsafe_code)] #[unsafe(no_mangle)]`, which a
-//! crate-wide `forbid` would reject (E0453).
+//! The whole crate is `#![forbid(unsafe_code)]`: since middleware 0.3,
+//! `mw_payload::payload!` expands to the five ABI exports without an
+//! `allow(unsafe_code)` in this crate.
 
 #![no_std]
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod app;
 

@@ -25,9 +25,9 @@ micropb = { version = "0.6.0", default-features = false, features = ["encode", "
 heapless = "0.9.3"
 badge-mw = { path = "crates/badge-mw" }
 # Transport-agnostic pub/sub + request/response; this repo validates it.
-middleware = { git = "https://github.com/jvishnefske/middleware", rev = "6b1720e8b4b7ef6983f53bb84227bbf759b1489d", default-features = false }
+middleware = { git = "https://github.com/jvishnefske/middleware", rev = "afd425a78d7bbe427ea09f28b8f1d47736efb0ab", default-features = false }
 # The badge runs middleware's wasm platform ("mw" ABI) on its wasmi host.
-wasm-host = { git = "https://github.com/jvishnefske/middleware", rev = "6b1720e8b4b7ef6983f53bb84227bbf759b1489d" }
+wasm-host = { git = "https://github.com/jvishnefske/middleware", rev = "afd425a78d7bbe427ea09f28b8f1d47736efb0ab" }
 
 # `badgectl sim` interprets the badge core with wasmi; unoptimised, the
 # interpreter is ~100x slower and the simulator tests take minutes.

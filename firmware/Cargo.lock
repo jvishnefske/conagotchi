@@ -167,7 +167,7 @@ dependencies = [
  "embedded-io 0.7.1",
  "embedded-io-async 0.7.0",
  "futures-intrusive",
- "heapless 0.9.3",
+ "heapless 0.8.0",
 ]
 
 [[package]]
@@ -988,7 +988,7 @@ dependencies = [
 [[package]]
 name = "esp-base"
 version = "0.1.0"
-source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
+source = "git+https://github.com/jvishnefske/middleware?rev=afd425a78d7bbe427ea09f28b8f1d47736efb0ab#afd425a78d7bbe427ea09f28b8f1d47736efb0ab"
 dependencies = [
  "embedded-storage",
  "heapless 0.9.3",
@@ -1955,8 +1955,8 @@ dependencies = [
 
 [[package]]
 name = "middleware"
-version = "0.2.0"
-source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
+version = "0.3.0"
+source = "git+https://github.com/jvishnefske/middleware?rev=afd425a78d7bbe427ea09f28b8f1d47736efb0ab#afd425a78d7bbe427ea09f28b8f1d47736efb0ab"
 dependencies = [
  "embedded-io-async 0.7.0",
 ]
@@ -2988,7 +2988,7 @@ dependencies = [
 [[package]]
 name = "wasm-host"
 version = "0.1.0"
-source = "git+https://github.com/jvishnefske/middleware?rev=6b1720e8b4b7ef6983f53bb84227bbf759b1489d#6b1720e8b4b7ef6983f53bb84227bbf759b1489d"
+source = "git+https://github.com/jvishnefske/middleware?rev=afd425a78d7bbe427ea09f28b8f1d47736efb0ab#afd425a78d7bbe427ea09f28b8f1d47736efb0ab"
 dependencies = [
  "middleware",
  "wasmi",

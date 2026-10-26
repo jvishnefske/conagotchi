@@ -1,8 +1,5 @@
-//! The demo payload's logic (see the crate docs). Every line of hand-written
-//! code lives here, under `forbid(unsafe_code)`; the crate root only expands
-//! `mw_payload::payload!`, whose generated exports need `#[unsafe(no_mangle)]`.
-
-#![forbid(unsafe_code)]
+//! The demo payload's logic (see the crate docs); the crate root only
+//! expands `mw_payload::payload!`.
 
 use mw_payload::{LogLine, Payload, Slot};
 

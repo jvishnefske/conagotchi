@@ -123,7 +123,7 @@ use embassy_time::{Instant, Timer};
 use esp_base::dispatch::tick_delay;
 use heapless::{String, Vec};
 use middleware::Key;
-use wasm_host::{AbiError, Device, Limits, Payload, Pull};
+use wasm_host::{AbiError, Device, Limits, Payload, Pull, Ticked};
 
 use crate::mw::{self, MwMessage};
 use crate::serial_link;
@@ -466,7 +466,8 @@ impl Runner {
             return;
         }
         match timed(|| p.tick(now)) {
-            Ok(()) => self.update(Lifecycle::ticked),
+            Ok(Ticked::Ran) => self.update(Lifecycle::ticked),
+            Ok(Ticked::NotDue | Ticked::Disabled | Ticked::NoTickExport) => {}
             Err(trap) => self.trapped(trap),
         }
     }

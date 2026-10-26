@@ -22,7 +22,7 @@ path = "src/lib.rs"
 [dependencies]
 # Same middleware revision as the host workspace (Cargo.toml, `middleware`
 # and `wasm-host`).
-mw-payload = { git = "https://github.com/jvishnefske/middleware", rev = "6b1720e8b4b7ef6983f53bb84227bbf759b1489d", package = "mw-payload" }
+mw-payload = { git = "https://github.com/jvishnefske/middleware", rev = "afd425a78d7bbe427ea09f28b8f1d47736efb0ab", package = "mw-payload" }
 
 [profile.release]
 opt-level = "z"

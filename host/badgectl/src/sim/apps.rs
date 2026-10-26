@@ -364,7 +364,7 @@ impl AppSlot {
                 return Ok(());
             }
             *ticks = ticks.wrapping_add(1);
-            p.tick(now_ms)
+            p.tick(now_ms).map(|_| ())
         })
     }
 
